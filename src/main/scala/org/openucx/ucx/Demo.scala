@@ -4,7 +4,7 @@ import java.nio.ByteBuffer
 
 import java.util.Random
 import java.util.concurrent.atomic.AtomicInteger
-import java.util.concurrent.{RunnableFuture,FutureTask,Semaphore,ConcurrentLinkedQueue,LinkedBlockingDeque}
+import java.util.concurrent.{RunnableFuture,FutureTask,Semaphore,TimeUnit,ConcurrentLinkedQueue,LinkedBlockingDeque}
 import scala.collection.mutable.Map
 import scala.collection.concurrent.TrieMap
 
@@ -12,6 +12,148 @@ import org.openucx.jucx.ucp._
 import org.openucx.jucx.ucs.UcsConstants
 import org.openucx.jucx.ucs.UcsConstants.MEMORY_TYPE
 import org.openucx.jucx.{UcxCallback, UcxException, UcxUtils}
+import org.openucx.jucx.NativeLibs
+
+trait Monitor {
+    def add(x: Int): Unit
+    def aggregate(): Unit
+}
+
+class PpsMonitor(name: String, count: Int = 100) extends Monitor {
+    private val aggrLocalRecord = new TrieMap[Long, Array[Int]]
+    private val aggrLocalId = new TrieMap[Long, AtomicInteger]
+    private val aggrOldId = new TrieMap[Long,Int]
+    
+    private val localRecord = new ThreadLocal[Array[Int]] {
+        override def initialValue = {
+            val record = new Array[Int](count)
+            aggrLocalRecord.put(Thread.currentThread().getId, record)
+            record
+        }
+    }
+
+    private val localId = new ThreadLocal[AtomicInteger] {
+        override def initialValue = {
+            val id = new AtomicInteger()
+            aggrOldId.put(Thread.currentThread().getId, 0)
+            aggrLocalId.put(Thread.currentThread().getId, id)
+            id
+        }
+    }
+
+    override def add(x: Int) = {
+        val id = localId.get.getAndIncrement
+        localRecord.get((id % count).abs) = x
+    }
+
+    override def aggregate(): Unit = {
+        aggrLocalId.foreach {
+            case (t, atomicId) => {
+                val id = atomicId.get
+                if (aggrOldId(t) != id) {
+                    aggrOldId.put(t, id)
+                } else {
+                    // aggrLocalRecord.remove(t)
+                    // aggrLocalId.remove(t)
+                    // aggrOldId.remove(t)
+                }
+            }
+        }
+        val records = {
+            val tmp = new Array[Int](count * aggrLocalRecord.size)
+            var i = 0
+            aggrLocalRecord.foreach {
+                case (_, record) => {
+                    record.copyToArray(tmp, i)
+                    i += count
+                }
+            }
+            tmp.sorted
+        }
+        if (records.size == 0) {
+            return 
+        }
+        val avg = records.sum / records.size
+        val v50 = records((records.size - 1) * 50 / 100)
+        val v80 = records((records.size - 1) * 80 / 100)
+        val v99 = records((records.size - 1) * 99 / 100)
+        Log.info(s"$name (average,50%,80%,99%)=($avg,$v50,$v80,$v99)")
+    }
+}
+
+class SumMonitor(name: String) extends Monitor {
+    private var timestamp: Long = System.currentTimeMillis
+    private var sizestamp: Long = 0
+    private val aggrLocalId = new TrieMap[Long, AtomicInteger]
+    private val aggrOldId = new TrieMap[Long,Int]
+
+    private val localId = new ThreadLocal[AtomicInteger] {
+        override def initialValue = {
+            val id = new AtomicInteger()
+            aggrOldId.put(Thread.currentThread().getId, 0)
+            aggrLocalId.put(Thread.currentThread().getId, id)
+            id
+        }
+    }
+
+    override def add(x: Int) = {
+        val id = localId.get
+        id.set(id.get + x)
+    }
+
+    override def aggregate() = {
+        aggrLocalId.foreach {
+            case (t, atomicId) => {
+                val id = atomicId.get
+                if (aggrOldId(t) != id) {
+                    aggrOldId.put(t, id)
+                } else {
+                    // aggrLocalId.remove(t)
+                    // aggrOldId.remove(t)
+                }
+            }
+        }
+        val sum = aggrOldId.values.sum
+        val cur = System.currentTimeMillis
+        val metric = (sum.toLong - sizestamp) * 1000 / (cur - timestamp)
+        timestamp = cur
+        sizestamp = sum
+        Log.info(s"$name ${metric}")
+    }
+}
+
+class MonitorThread(time: Int = 1000) extends Thread {
+    private val monitors = new TrieMap[String, Monitor]
+    private val sleeper = new Semaphore(0)
+
+    setDaemon(true)
+    setName(s"Monitor")
+
+    def reg(name: String, monitor: Monitor) = {
+        monitors.getOrElseUpdate(name, monitor)
+    }
+
+    def get(name: String) = {
+        monitors(name)
+    }
+
+    def close = sleeper.release
+
+    override def run() = {
+        while(!isInterrupted) {
+            sleeper.tryAcquire(time, TimeUnit.MILLISECONDS)
+            val cur = System.currentTimeMillis
+            monitors.values.foreach(_.aggregate)
+        }
+    }
+}
+
+object Global {
+    val monitor = new MonitorThread()
+    monitor.reg("ReadBW", new SumMonitor("Read (MB/s)"))
+    monitor.reg("ReadLat", new PpsMonitor("Read (ms)", 100))
+    monitor.start
+}
 
 class RecvMessage {
     var fid = 0
@@ -48,6 +190,9 @@ class RecvMessage {
 class Client extends Thread {
     private val service = new UcxWorkerService()
     private val callbacks =  new TrieMap[Long, RunnableFuture[_]]
+
+    val bwMonitor = Global.monitor.get("ReadBW")
+    val latMonitor = Global.monitor.get("ReadLat")
 
     private val recvHandle = new UcpAmRecvCallback {
         override def onReceive(headerAddress: Long, headerSize: Long, ucpAmData: UcpAmData, ep: UcpEndpoint) = {
@@ -96,8 +241,11 @@ class Client extends Thread {
         callbacks.put(fid, new FutureTask(
             new Runnable {
                 override def run = {
+                    val timecost = System.nanoTime() - startTime
+                    bwMonitor.add(expect >> 20)
+                    latMonitor.add((timecost / 1000000).toInt)
                     Log.trace(s"Total time for flightId $fid size $expect is " + 
-                        s"${System.nanoTime() - startTime} ns")
+                        s"${timecost} ns")
                     Option(flightLimit) match {
                         case Some(sem) => sem.release
                         case None => ()
@@ -257,10 +405,15 @@ object Demo {
         println(s"numServers=${numServers}")
         println(s"numFlights=${numFlights}")
 
+        NativeLibs.load()
+
         if (!hosts.isEmpty) {
             val client = new Client
             client.init(numClients, hosts, numFlights, iterations, msgSize)
-            client.start
+            if (!listen.isEmpty)
+                client.start
+            else
+                client.run
         }
 
         if (!listen.isEmpty) {
@@ -268,6 +421,8 @@ object Demo {
             server.init(numServers, listen)
             server.run
         }
+
+        Global.monitor.close
     }
 
     def parseArgs(args: Array[String]): Map[String,String] = {

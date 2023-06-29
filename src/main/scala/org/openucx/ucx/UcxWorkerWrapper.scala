@@ -1,5 +1,6 @@
 package org.openucx.ucx
 
+import java.lang.management.ManagementFactory
 import java.net.InetAddress
 import java.nio.ByteBuffer
 import java.util.concurrent.{RunnableFuture, FutureTask, TimeUnit, ConcurrentLinkedQueue, Semaphore}
@@ -14,7 +15,8 @@ import org.openucx.jucx.ucs.UcsConstants.MEMORY_TYPE
 import org.openucx.jucx.{UcxCallback, UcxException, UcxUtils}
 
 class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
-    private val uniName = InetAddress.getLocalHost.getHostName + s"-$id"
+    // private val hostName = InetAddress.getLocalHost.getHostName
+    private val uniName = s"${ManagementFactory.getRuntimeMXBean.getName}#$id"
 
     private var taskLimit: Semaphore = null
     private val taskQueue = new ConcurrentLinkedQueue[RunnableFuture[_]]()

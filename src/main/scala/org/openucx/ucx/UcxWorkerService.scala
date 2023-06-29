@@ -24,6 +24,9 @@ class UcxWorkerService extends AbstractExecutorService {
             .requestWakeupEdge()
     private var executors: Array[UcxWorkerWrapper] = _
     private var listener: UcxWorkerWrapper = _
+    private var ucpListener: UcpListener = _
+    private var connectionHandler: UcpListenerConnectionHandler = _
+    private var connectbackHandler: UcpAmRecvCallback = _
     private var bShutDown = false
     private var bTermed = false
     private var bInit = false
@@ -48,18 +51,13 @@ class UcxWorkerService extends AbstractExecutorService {
                     new InetSocketAddress(host(0), host(1).toInt)
                 })
             }
-            val fs = executors.flatMap { (x) => {
-                val f = newTaskFor(new Runnable {
+            executors.foreach { (x) => {
+                x.submit(newTaskFor(new Runnable {
                     override def run = {
-                        UcxWorkerService.serverSocket.keys.foreach {
-                            x.getOrConnect(_)
-                        }
+                        UcxWorkerService.serverSocket.keys.foreach(x.getOrConnect(_))
                     }
-                }, Unit)
-                x.submit(f)
-                Seq(f)
+                }, Unit))
             }}
-            fs.foreach(_.get)
             // for (hostPort <- hostPortList.split(",")) {
             //     UcxWorkerService.serverSocket.getOrElseUpdate(hostPort, {
             //         val host = hostPort.split(":")
@@ -97,26 +95,8 @@ class UcxWorkerService extends AbstractExecutorService {
         listener = new UcxWorkerWrapper(UcxWorkerService.ucxContext.newWorker(ucpWorkerParams))
         // message handles
         listener.initService(handles)
-        listener.worker.setAmRecvHandler(UcxAmId.CONNECTION.id,
-            (headerAddress: Long, headerSize: Long, amData: UcpAmData, _: UcpEndpoint) => {
-            val header = UnsafeUtils.getByteBufferView(headerAddress, headerSize.toInt)
-            val workerAddress = UnsafeUtils.getByteBufferView(amData.getDataAddress, amData.getLength.toInt)
-            val workerName = java.nio.charset.StandardCharsets.UTF_8.decode(header).toString
-
-            UcxWorkerService.clientWorker.put(workerName, workerAddress)
-            executors.foreach { x =>
-                x.submit(newTaskFor(new Runnable {
-                    override def run = x.getOrConnectBack(workerName)
-                }, Unit))
-            }
-            // executors.foreach {
-            //     _.getOrConnectBack(workerName)
-            // }
-            UcsConstants.STATUS.UCS_OK
-        }, UcpConstants.UCP_AM_FLAG_WHOLE_MSG)
-        listener.worker.newListener(new UcpListenerParams()
-            .setSockAddr(listenAddress)
-            .setConnectionHandler((req: UcpConnectionRequest) => {
+        connectionHandler = new UcpListenerConnectionHandler {
+            override def onConnectionRequest(req: UcpConnectionRequest) = {
                 Log.debug(s"Listener $this receive connecting from ${req.getClientId}")
 
                 val ep = listener.worker.newEndpoint(
@@ -137,7 +117,31 @@ class UcxWorkerService extends AbstractExecutorService {
                         .setName(s"Endpoint to ${req.getClientId}")
                 )
                 UcxWorkerService.endpoints.add(ep)
-            }))
+            }
+        }
+        connectbackHandler = new UcpAmRecvCallback {
+            override def onReceive(headerAddress: Long, headerSize: Long, amData: UcpAmData, ep: UcpEndpoint) = {
+                val header = UnsafeUtils.getByteBufferView(headerAddress, headerSize.toInt)
+                val workerAddress = UnsafeUtils.getByteBufferView(amData.getDataAddress, amData.getLength.toInt)
+                val workerName = java.nio.charset.StandardCharsets.UTF_8.decode(header).toString
+
+                UcxWorkerService.clientWorker.put(workerName, workerAddress)
+                executors.foreach { x =>
+                    x.submit(newTaskFor(new Runnable {
+                        override def run = x.getOrConnectBack(workerName)
+                    }, Unit))
+                }
+                // executors.foreach {
+                //     _.getOrConnectBack(workerName)
+                // }
+                UcsConstants.STATUS.UCS_OK
+            }
+        }
+        listener.worker.setAmRecvHandler(
+            UcxAmId.CONNECTION.id, connectbackHandler, UcpConstants.UCP_AM_FLAG_WHOLE_MSG)
+        ucpListener = listener.worker.newListener(new UcpListenerParams()
+            .setSockAddr(listenAddress)
+            .setConnectionHandler(connectionHandler))
         listener.start
     }
 
