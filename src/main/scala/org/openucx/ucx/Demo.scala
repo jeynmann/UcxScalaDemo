@@ -137,7 +137,7 @@ class MonitorThread(time: Int = 1000) extends Thread {
         monitors(name)
     }
 
-    def close = sleeper.release
+    def release = sleeper.release
 
     override def run() = {
         while(!isInterrupted) {
@@ -407,22 +407,40 @@ object Demo {
 
         NativeLibs.load()
 
-        if (!hosts.isEmpty) {
-            val client = new Client
-            client.init(numClients, hosts, numFlights, iterations, msgSize)
-            if (!listen.isEmpty)
-                client.start
+        val server = if (!listen.isEmpty) {
+            val srv = new Server
+            srv.init(numServers, listen)
+            if (!hosts.isEmpty)
+                srv.start
             else
-                client.run
+                srv.run
+            srv
+        } else {
+            null
         }
 
-        if (!listen.isEmpty) {
-            val server = new Server
-            server.init(numServers, listen)
-            server.run
+        val client = if (!hosts.isEmpty) {
+            val cli = new Client
+            cli.init(numClients, hosts, numFlights, iterations, msgSize)
+            cli.run
+            cli
+        } else {
+            null
         }
 
-        Global.monitor.close
+        Option(client) match {
+            case Some(cli) => cli.close
+            case None => {}
+        }
+
+        Option(server) match {
+            case Some(srv) => srv.close
+            case None => {}
+        }
+
+        Global.monitor.interrupt
+        Global.monitor.release
+        Global.monitor.join(10)
     }
 
     def parseArgs(args: Array[String]): Map[String,String] = {

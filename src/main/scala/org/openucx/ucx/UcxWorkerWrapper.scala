@@ -95,8 +95,8 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
             header.rewind()
 
             ep.sendAmNonBlocking(UcxAmId.CONNECTION.id,
-                UcxUtils.getAddress(header), header.limit,
-                UcxUtils.getAddress(workerAddress), workerAddress.limit,
+                UcxUtils.getAddress(header), header.limit(),
+                UcxUtils.getAddress(workerAddress), workerAddress.limit(),
                 UcpConstants.UCP_AM_SEND_FLAG_EAGER,
                 new UcxCallback {
                     override def onSuccess(request: UcpRequest): Unit = {
@@ -159,6 +159,7 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
 
     @inline
     def close(): Unit = {
+        Log.debug((s"Worker-$id closing"))
         val reqs = connections.map {
             case (_, endpoint) => endpoint.closeNonBlockingForce()
         }
@@ -167,6 +168,7 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
         }
         connections.clear()
         worker.close()
+        Log.debug((s"Worker-$id closed"))
     }
 }
 

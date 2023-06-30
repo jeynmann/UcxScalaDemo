@@ -173,9 +173,10 @@ class UcxWorkerService extends AbstractExecutorService {
 
     def run = {}
 
-    def close(timeout: Long = 0L, unit: TimeUnit = TimeUnit.MILLISECONDS) = {
+    def close(timeout: Long = 1L, unit: TimeUnit = TimeUnit.MILLISECONDS) = {
         executors.foreach (x => {
             x.interrupt()
+            x.worker.signal
             x.join(unit.toMillis(timeout))
             x.close()
         })
