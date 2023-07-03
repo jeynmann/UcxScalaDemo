@@ -27,6 +27,7 @@ class UcxWorkerService extends AbstractExecutorService {
     private var ucpListener: UcpListener = _
     private var connectionHandler: UcpListenerConnectionHandler = _
     private var connectbackHandler: UcpAmRecvCallback = _
+    private var introduceHandler: UcpAmRecvCallback = _
     private var bShutDown = false
     private var bTermed = false
     private var bInit = false
@@ -51,20 +52,13 @@ class UcxWorkerService extends AbstractExecutorService {
                     new InetSocketAddress(host(0), host(1).toInt)
                 })
             }
-            executors.foreach { (x) => {
-                x.submit(newTaskFor(new Runnable {
-                    override def run = {
-                        UcxWorkerService.serverSocket.keys.foreach(x.getOrConnect(_))
-                    }
-                }, Unit))
-            }}
-            // for (hostPort <- hostPortList.split(",")) {
-            //     UcxWorkerService.serverSocket.getOrElseUpdate(hostPort, {
-            //         val host = hostPort.split(":")
-            //         new InetSocketAddress(host(0), host(1).toInt)
-            //     })
-            //     executors.foreach(_.getOrConnect(hostPort))
-            // }
+            for (hostPort <- hostPortList.split(",")) {
+                UcxWorkerService.serverSocket.getOrElseUpdate(hostPort, {
+                    val host = hostPort.split(":")
+                    new InetSocketAddress(host(0), host(1).toInt)
+                })
+                executors.foreach(_.getOrConnect(hostPort))
+            }
         }
         bInit = true
     }
@@ -78,7 +72,6 @@ class UcxWorkerService extends AbstractExecutorService {
             }
             executors(i) = new UcxWorkerWrapper(UcxWorkerService.ucxContext.newWorker(ucpWorkerParams), id)
             executors(i).initService(handles)
-            executors(i).start
         }
     }
 
@@ -126,14 +119,9 @@ class UcxWorkerService extends AbstractExecutorService {
                 val workerName = java.nio.charset.StandardCharsets.UTF_8.decode(header).toString
 
                 UcxWorkerService.clientWorker.put(workerName, workerAddress)
-                executors.foreach { x =>
-                    x.submit(newTaskFor(new Runnable {
-                        override def run = x.getOrConnectBack(workerName)
-                    }, Unit))
+                executors.foreach {
+                    _.getOrConnectBack(workerName)
                 }
-                // executors.foreach {
-                //     _.getOrConnectBack(workerName)
-                // }
                 UcsConstants.STATUS.UCS_OK
             }
         }
@@ -142,7 +130,44 @@ class UcxWorkerService extends AbstractExecutorService {
         ucpListener = listener.worker.newListener(new UcpListenerParams()
             .setSockAddr(listenAddress)
             .setConnectionHandler(connectionHandler))
-        listener.start
+    }
+
+    /**
+     * allows to handle introduce message
+     */
+    def initIntroduce(clientService: UcxWorkerService) = {
+        introduceHandler = new UcpAmRecvCallback {
+            override def onReceive(headerAddress: Long, headerSize: Long, amData: UcpAmData, ep: UcpEndpoint) = {
+                val header = UnsafeUtils.getByteBufferView(headerAddress, headerSize.toInt)
+                val name = java.nio.charset.StandardCharsets.UTF_8.decode(header).toString
+                val socketBuffer = UnsafeUtils.getByteBufferView(amData.getDataAddress, amData.getLength.toInt)
+                val socketPort = socketBuffer.getInt
+                val socketAddress = new InetSocketAddress(java.nio.charset.StandardCharsets.UTF_8.decode(socketBuffer).toString, socketPort)
+
+                UcxWorkerService.serverSocket.put(name, socketAddress)
+                clientService.executors.foreach { x =>
+                    submit(newTaskFor(new Runnable {
+                        override def run = x.getOrConnect(name)
+                    }, Unit))
+                }
+                UcsConstants.STATUS.UCS_OK
+            }
+        }
+        listener.worker.setAmRecvHandler(
+            UcxAmId.INTRODUCE.id, introduceHandler, UcpConstants.UCP_AM_FLAG_WHOLE_MSG)
+    }
+
+    /**
+     * introduce current listener address to all servers
+     */
+    def introduceListener(): Unit = {
+        executors.foreach { (x) => {
+            x.submit(newTaskFor(new Runnable {
+                override def run = {
+                    UcxWorkerService.listenSocket.keys.foreach(x.introduceListener(_))
+                }
+            }, Unit))
+        }}
     }
 
     @inline
@@ -171,7 +196,13 @@ class UcxWorkerService extends AbstractExecutorService {
         f
     }
 
-    def run = {}
+    def run = {
+        executors.foreach(_.start)
+        Option(listener) match {
+            case Some(t) => t.start
+            case None => ()
+        }
+    }
 
     def close(timeout: Long = 1L, unit: TimeUnit = TimeUnit.MILLISECONDS) = {
         executors.foreach (x => {

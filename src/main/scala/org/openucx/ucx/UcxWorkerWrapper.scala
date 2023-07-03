@@ -108,6 +108,34 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
         })
     }
 
+    def introduceListener(host: String): Unit = {
+        connections.foreach { case (name, ep) => {
+            val socketAddress = UcxWorkerService.listenSocket(host)
+            val hostAddress = socketAddress.getAddress.getHostAddress
+            val hostPort = socketAddress.getPort
+            
+            Log.debug(s"Client $this introduce ($host) to server ($name)")
+            
+            val headerSize = host.size
+            val bodySize = UnsafeUtils.INT_SIZE + hostAddress.size
+            val buf = ByteBuffer.allocateDirect(headerSize + bodySize)
+            val bufAddress = UcxUtils.getAddress(buf)
+            buf.put(host.getBytes)
+            buf.putInt(hostPort)
+            buf.put(hostAddress.getBytes)
+            buf.rewind()
+            
+            ep.sendAmNonBlocking(UcxAmId.INTRODUCE.id,
+                bufAddress, headerSize, bufAddress + headerSize, bodySize,
+                UcpConstants.UCP_AM_SEND_FLAG_EAGER,
+                new UcxCallback {
+                    override def onSuccess(request: UcpRequest): Unit = {
+                        buf.clear()
+                    }
+                }, MEMORY_TYPE.UCS_MEMORY_TYPE_HOST)
+        }}
+    }
+
     // def send(host: String, header: ByteBuffer, body: ByteBuffer, callback: UcxCallback,
     //     flags:Long = 0, memoryType:Int = MEMORY_TYPE.UCS_MEMORY_TYPE_HOST) = {
     //     val hAddress = UnsafeUtils.getAdress(header)
