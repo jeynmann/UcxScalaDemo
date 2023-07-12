@@ -3,7 +3,7 @@ package org.openucx.ucx
 import java.lang.management.ManagementFactory
 import java.net.InetAddress
 import java.nio.ByteBuffer
-import java.util.concurrent.{RunnableFuture, FutureTask, TimeUnit, ConcurrentLinkedQueue, Semaphore}
+import java.util.concurrent.{TimeUnit, ConcurrentLinkedQueue, Semaphore}
 import java.util.concurrent.atomic.AtomicInteger
 
 import scala.collection.concurrent.TrieMap
@@ -19,7 +19,7 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
     private val uniName = s"${ManagementFactory.getRuntimeMXBean.getName}#$id"
 
     private var taskLimit: Semaphore = null
-    private val taskQueue = new ConcurrentLinkedQueue[RunnableFuture[_]]()
+    private val taskQueue = new ConcurrentLinkedQueue[Runnable]()
 
     private val connections = new TrieMap[String, UcpEndpoint]
 
@@ -159,10 +159,7 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
             Option(taskQueue.poll()) match {
                 case Some(task) => {
                     task.run
-                    Option(taskLimit) match {
-                        case Some(sem) => sem.release
-                        case None => ()
-                    }
+                    release
                 }
                 case None => {}
             }
@@ -176,11 +173,20 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
     }
 
     @inline
-    def submit(task: RunnableFuture[_]) = {
-        Option(taskLimit) match {
-            case Some(sem) => sem.acquire
-            case None => ()
-        }
+    def acquire(): Unit = Option(taskLimit) match {
+        case Some(sem) => sem.acquire
+        case None => ()
+    }
+
+    @inline
+    def release(): Unit = Option(taskLimit) match {
+        case Some(sem) => sem.release
+        case None => ()
+    }
+
+    @inline
+    def submit(task: Runnable) = {
+        acquire
         taskQueue.offer(task)
         worker.signal()
     }

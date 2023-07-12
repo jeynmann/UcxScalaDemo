@@ -28,6 +28,8 @@ class UcxWorkerService extends AbstractExecutorService {
     private var connectionHandler: UcpListenerConnectionHandler = _
     private var connectbackHandler: UcpAmRecvCallback = _
     private var introduceHandler: UcpAmRecvCallback = _
+    private var bClient: Boolean = _
+    private var bSequentialConnecting = false
     private var bShutDown = false
     private var bTermed = false
     private var bInit = false
@@ -35,39 +37,46 @@ class UcxWorkerService extends AbstractExecutorService {
     private final val connections = new TrieMap[String, UcpEndpoint]
     
     def initServer(n: Int, hostPort: String, handles: Array[(Int, UcpAmRecvCallback, Long)] = null) = {
-        initExecutors(n, null, 32)
+        bClient = false
+        initExecutors(n, null)
         initListener(hostPort, handles)
         bInit = true
     }
 
     def initClient(n: Int, hostPortList: String = "", handles: Array[(Int, UcpAmRecvCallback, Long)] = null, numTasks: Int = 0) = {
+        bClient = true
         initExecutors(n, handles)
         if (numTasks > 0) {
             executors.foreach(_.initTaskLimit(numTasks))
         }
         if (!hostPortList.isEmpty) {
             for (hostPort <- hostPortList.split(",")) {
-                UcxWorkerService.serverSocket.getOrElseUpdate(hostPort, {
-                    val host = hostPort.split(":")
-                    new InetSocketAddress(host(0), host(1).toInt)
-                })
+                if (!hostPort.isEmpty) {
+                    UcxWorkerService.serverSocket.getOrElseUpdate(hostPort, {
+                        val host = hostPort.split(":")
+                        new InetSocketAddress(host(0), host(1).toInt)
+                    })
+                }
             }
-            for (hostPort <- hostPortList.split(",")) {
-                UcxWorkerService.serverSocket.getOrElseUpdate(hostPort, {
-                    val host = hostPort.split(":")
-                    new InetSocketAddress(host(0), host(1).toInt)
-                })
-                executors.foreach(_.getOrConnect(hostPort))
+            if (bSequentialConnecting) {
+                executors.foreach { x => UcxWorkerService.serverSocket.keys.foreach(x.getOrConnect(_)) }
+            } else {
+                executors.foreach { x =>
+                    x.submit(newTaskFor(new Runnable {
+                        override def run = UcxWorkerService.serverSocket.keys.foreach(x.getOrConnect(_))
+                    }, Unit))
+                }
             }
         }
         bInit = true
     }
 
-    private def initExecutors(n: Int, handles: Array[(Int, UcpAmRecvCallback, Long)], shift: Int = 0) = {
+    private def initExecutors(n: Int, handles: Array[(Int, UcpAmRecvCallback, Long)]) = {
+        val shift = if (bClient) 32 else 0
         executors = new Array[UcxWorkerWrapper](n)
         for (i <- 0 until n) {
             val id = (i + 1).toLong << shift
-            if (shift == 0) {
+            if (bClient) {
                 ucpWorkerParams.setClientId(id)
             }
             executors(i) = new UcxWorkerWrapper(UcxWorkerService.ucxContext.newWorker(ucpWorkerParams), id)
@@ -119,8 +128,14 @@ class UcxWorkerService extends AbstractExecutorService {
                 val workerName = java.nio.charset.StandardCharsets.UTF_8.decode(header).toString
 
                 UcxWorkerService.clientWorker.put(workerName, workerAddress)
-                executors.foreach {
-                    _.getOrConnectBack(workerName)
+                if (bSequentialConnecting) {
+                    executors.foreach { x => x.getOrConnectBack(workerName) }
+                } else {
+                    executors.foreach { x =>
+                        x.submit(newTaskFor(new Runnable {
+                            override def run = x.getOrConnectBack(workerName)
+                        }, Unit))
+                    }
                 }
                 UcsConstants.STATUS.UCS_OK
             }
@@ -135,7 +150,15 @@ class UcxWorkerService extends AbstractExecutorService {
     /**
      * allows to handle introduce message
      */
-    def initIntroduce(clientService: UcxWorkerService) = {
+    @inline
+    def initIntroduce(clientService: UcxWorkerService): Unit = {
+        Option (clientService) match {
+            case Some(service) => initIntroduceHandle(clientService)
+            case None => Log.warn("initIntroduce with null clientService.")
+        }
+    }
+
+    private def initIntroduceHandle(clientService: UcxWorkerService): Unit = {
         introduceHandler = new UcpAmRecvCallback {
             override def onReceive(headerAddress: Long, headerSize: Long, amData: UcpAmData, ep: UcpEndpoint) = {
                 val header = UnsafeUtils.getByteBufferView(headerAddress, headerSize.toInt)
@@ -145,10 +168,14 @@ class UcxWorkerService extends AbstractExecutorService {
                 val socketAddress = new InetSocketAddress(java.nio.charset.StandardCharsets.UTF_8.decode(socketBuffer).toString, socketPort)
 
                 UcxWorkerService.serverSocket.put(name, socketAddress)
-                clientService.executors.foreach { x =>
-                    submit(newTaskFor(new Runnable {
-                        override def run = x.getOrConnect(name)
-                    }, Unit))
+                if (bSequentialConnecting) {
+                    clientService.executors.foreach { x => x.getOrConnect(name) }
+                } else {
+                    clientService.executors.foreach { x =>
+                        x.submit(newTaskFor(new Runnable {
+                            override def run = x.getOrConnect(name)
+                        }, Unit))
+                    }
                 }
                 UcsConstants.STATUS.UCS_OK
             }
@@ -157,17 +184,43 @@ class UcxWorkerService extends AbstractExecutorService {
             UcxAmId.INTRODUCE.id, introduceHandler, UcpConstants.UCP_AM_FLAG_WHOLE_MSG)
     }
 
+    def connectInSequential(isSeq: Boolean = true): Unit = bSequentialConnecting = isSeq
     /**
      * introduce current listener address to all servers
      */
     def introduceListener(): Unit = {
-        executors.foreach { (x) => {
-            x.submit(newTaskFor(new Runnable {
-                override def run = {
-                    UcxWorkerService.listenSocket.keys.foreach(x.introduceListener(_))
-                }
-            }, Unit))
-        }}
+        if (bSequentialConnecting) {
+            executors.foreach { x =>
+                UcxWorkerService.listenSocket.keys.foreach(x.introduceListener(_))
+            }
+        } else {
+            executors.foreach { x =>
+                x.submit(newTaskFor(new Runnable {
+                    override def run = {
+                        UcxWorkerService.listenSocket.keys.foreach(x.introduceListener(_))
+                    }
+                }, Unit))
+            }
+        }
+    }
+
+    def run = {
+        executors.foreach(_.start)
+        Option(listener) match {
+            case Some(t) => t.start
+            case None => ()
+        }
+    }
+
+    def close(timeout: Long = 1L, unit: TimeUnit = TimeUnit.MILLISECONDS) = {
+        executors.foreach (x => {
+            x.interrupt()
+            x.worker.signal()
+            x.join(unit.toMillis(timeout))
+            x.close()
+        })
+        bShutDown = true
+        bTermed = true
     }
 
     @inline
@@ -175,8 +228,6 @@ class UcxWorkerService extends AbstractExecutorService {
         val i = (id.getAndIncrement % executors.size).abs
         executors(i)
     }
-
-    override def execute(task: Runnable) = submit(task)
 
     def submit(task: Callable[_]) = {
         val f = newTaskFor(task)
@@ -196,24 +247,8 @@ class UcxWorkerService extends AbstractExecutorService {
         f
     }
 
-    def run = {
-        executors.foreach(_.start)
-        Option(listener) match {
-            case Some(t) => t.start
-            case None => ()
-        }
-    }
+    override def execute(task: Runnable) = submit(task)
 
-    def close(timeout: Long = 1L, unit: TimeUnit = TimeUnit.MILLISECONDS) = {
-        executors.foreach (x => {
-            x.interrupt()
-            x.worker.signal
-            x.join(unit.toMillis(timeout))
-            x.close()
-        })
-        bShutDown = true
-        bTermed = true
-    }
     override def isShutdown() = bShutDown
     override def isTerminated() = bTermed
     override def awaitTermination(timeout: Long, unit: TimeUnit) = {
