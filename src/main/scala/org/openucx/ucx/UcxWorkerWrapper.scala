@@ -14,14 +14,15 @@ import org.openucx.jucx.ucs.UcsConstants
 import org.openucx.jucx.ucs.UcsConstants.MEMORY_TYPE
 import org.openucx.jucx.{UcxCallback, UcxException, UcxUtils}
 
-class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
+class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0, name: String = "") extends Thread {
     // private val hostName = InetAddress.getLocalHost.getHostName
-    private val uniName = s"${ManagementFactory.getRuntimeMXBean.getName}#$id"
+    private val uniName = if (!name.isEmpty) name else s"${ManagementFactory.getRuntimeMXBean.getName}#$id"
 
     private var taskLimit: Semaphore = null
     private val taskQueue = new ConcurrentLinkedQueue[Runnable]()
 
     private val connections = new TrieMap[String, UcpEndpoint]
+    private var connectionHandler: UcpListenerConnectionHandler = _
 
     setDaemon(true)
     setName(s"Worker-$id")
@@ -72,7 +73,7 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
     }
 
     def getOrConnect(host: String): UcpEndpoint = {
-        connections.getOrElseUpdate(host,  {
+        connections.getOrElseUpdate(host, {
             val socketAddress = UcxWorkerService.serverSocket(host)
             val endpointParams = new UcpEndpointParams()
                 .setPeerErrorHandlingMode()
@@ -89,43 +90,91 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
             Log.debug(s"Client $this connecting to server($host, $socketAddress)")
 
             val ep = worker.newEndpoint(endpointParams)
-            val header = ByteBuffer.allocateDirect(uniName.size)
-            val workerAddress = worker.getAddress
-            header.put(uniName.getBytes)
-            header.rewind()
-
-            ep.sendAmNonBlocking(UcxAmId.CONNECTION.id,
-                UcxUtils.getAddress(header), header.limit(),
-                UcxUtils.getAddress(workerAddress), workerAddress.limit(),
-                UcpConstants.UCP_AM_SEND_FLAG_EAGER,
-                new UcxCallback {
-                    override def onSuccess(request: UcpRequest): Unit = {
-                        header.clear()
-                        workerAddress.clear()
-                    }
-                }, MEMORY_TYPE.UCS_MEMORY_TYPE_HOST)
             ep
         })
     }
 
-    def introduceListener(host: String): Unit = {
-        connections.foreach { case (name, ep) => {
-            val socketAddress = UcxWorkerService.listenSocket(host)
-            val hostAddress = socketAddress.getAddress.getHostAddress
-            val hostPort = socketAddress.getPort
-            
-            Log.debug(s"Client $this introduce ($host) to server ($name)")
-            
-            val headerSize = host.size
-            val bodySize = UnsafeUtils.INT_SIZE + hostAddress.size
-            val buf = ByteBuffer.allocateDirect(headerSize + bodySize)
-            val bufAddress = UcxUtils.getAddress(buf)
-            buf.put(host.getBytes)
-            buf.putInt(hostPort)
-            buf.put(hostAddress.getBytes)
-            buf.rewind()
-            
-            ep.sendAmNonBlocking(UcxAmId.INTRODUCE.id,
+    def connecting(host: String) = {
+        val header = ByteBuffer.allocateDirect(uniName.size)
+        val workerAddress = worker.getAddress
+        header.put(uniName.getBytes)
+        header.rewind()
+
+        getOrConnect(host).sendAmNonBlocking(UcxAmId.CONNECTION.id,
+            UcxUtils.getAddress(header), header.limit(),
+            UcxUtils.getAddress(workerAddress), workerAddress.limit(),
+            UcpConstants.UCP_AM_SEND_FLAG_EAGER,
+            new UcxCallback {
+                override def onSuccess(request: UcpRequest): Unit = {
+                    header.clear()
+                    workerAddress.clear()
+                }
+            }, MEMORY_TYPE.UCS_MEMORY_TYPE_HOST)
+    }
+
+    def getOrFollow(host: String): UcpEndpoint = {
+        connections.getOrElseUpdate(host, {
+            val socketAddress = UcxWorkerService.leaderSocket(host)
+            val endpointParams = new UcpEndpointParams()
+                .setPeerErrorHandlingMode()
+                .setSocketAddress(socketAddress)
+                .sendClientId()
+                .setErrorHandler(
+                new UcpEndpointErrorHandler() {
+                    override def onError(ep: UcpEndpoint, status: Int, errorMsg: String): Unit = {
+                        Log.warn(s"Client to $host got an error: $errorMsg")
+                        connections.remove(host)
+                    }
+                }).setName(s"Client to $host")
+
+            Log.debug(s"Member $this following to leader($host, $socketAddress)")
+
+            worker.newEndpoint(endpointParams)
+        })
+    }
+
+    def following(leader: String): Unit = {
+        val socketAddress = UcxWorkerService.listenSocket(uniName)
+        val (port, address) = Utils.newInetSocketTuple(socketAddress)
+
+        val headerSize = uniName.size
+        val bodySize = UnsafeUtils.INT_SIZE + address.size
+        val buf = ByteBuffer.allocateDirect(headerSize + bodySize)
+        val bufAddress = UcxUtils.getAddress(buf)
+
+        buf.put(uniName.getBytes)
+        buf.putInt(port)
+        buf.put(address)
+        buf.rewind()
+
+        getOrFollow(leader).sendAmNonBlocking(UcxAmId.JOINING.id,
+            bufAddress, headerSize, bufAddress + headerSize, bodySize,
+            UcpConstants.UCP_AM_SEND_FLAG_EAGER,
+            new UcxCallback {
+                override def onSuccess(request: UcpRequest): Unit = {
+                    buf.clear()
+                }
+            }, MEMORY_TYPE.UCS_MEMORY_TYPE_HOST)
+    }
+
+    def introduce(hostName: String, socketBuffer: ByteBuffer)= {
+        // existing members connect to new member
+        val headerSize = UnsafeUtils.INT_SIZE
+        val bodySize = socketBuffer.limit
+        val buf = ByteBuffer.allocateDirect(headerSize + bodySize)
+        val bufAddress = UcxUtils.getAddress(buf)
+
+        socketBuffer.rewind()
+        buf.putInt(1)
+        buf.put(socketBuffer)
+        buf.rewind()
+
+        Log.trace(s"Introduce $hostName to members")
+
+        val eps = connections.filterKeys(_ != hostName)
+        eps.foreach { case (_, ep) => {
+                // existing members connect to new member
+                ep.sendAmNonBlocking(UcxAmId.INTRODUCE.id,
                 bufAddress, headerSize, bufAddress + headerSize, bodySize,
                 UcpConstants.UCP_AM_SEND_FLAG_EAGER,
                 new UcxCallback {
@@ -133,7 +182,75 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
                         buf.clear()
                     }
                 }, MEMORY_TYPE.UCS_MEMORY_TYPE_HOST)
+            }}
+    }
+
+    def introduceAll(hostName: String): Unit = {
+        val memberSockets = UcxWorkerService.serverSocket.filterKeys(_ != hostName)
+        val members = memberSockets.values.map(Utils.newInetSocketTuple(_))
+
+        if (members.isEmpty) {
+            return
+        }
+
+        val headerSize = UnsafeUtils.INT_SIZE
+        val bodySize = members.map {
+            case (_, socketBytes) => UnsafeUtils.INT_SIZE + socketBytes.size }.sum
+        val buf = ByteBuffer.allocateDirect(headerSize + bodySize)
+        val bufAddress = UcxUtils.getAddress(buf)
+
+        buf.putInt(members.size)
+        members.foreach { case (port, socketAddress) => {
+            buf.putInt(port)
+            buf.put(socketAddress)
         }}
+
+        Log.trace(s"Introduce members ${members} to new($hostName)")
+
+        val ep = connections(hostName)
+        ep.sendAmNonBlocking(UcxAmId.INTRODUCE.id,
+            bufAddress, headerSize, bufAddress + headerSize, bodySize, 0,
+            new UcxCallback {
+                override def onSuccess(request: UcpRequest): Unit = {
+                    buf.clear()
+                }
+            }, MEMORY_TYPE.UCS_MEMORY_TYPE_HOST)
+    }
+
+    def getConnectionHandle: UcpListenerConnectionHandler = {
+        Option(connectionHandler) match {
+            case Some(handle) => handle
+            case None => {
+                connectionHandler = new UcpListenerConnectionHandler {
+                    override def onConnectionRequest(req: UcpConnectionRequest) = {
+                        val name = Utils.newString(req.getClientAddress)
+
+                        Log.debug(s"Listener $this receive connecting from ${name}")
+
+                        val errHandle = new UcpEndpointErrorHandler {
+                            override def onError(ucpEndpoint: UcpEndpoint, errorCode: Int, errorString: String): Unit = {
+                                if (errorCode == UcsConstants.STATUS.UCS_ERR_CONNECTION_RESET) {
+                                    Log.warn(s"Connection closed on ep: $ucpEndpoint")
+                                } else {
+                                    Log.error(s"Ep $ucpEndpoint got an error: $errorString")
+                                }
+                                connections.remove(name)
+                                ucpEndpoint.close()
+                            }
+                        }
+                        val ep = worker.newEndpoint(
+                            new UcpEndpointParams()
+                                .setConnectionRequest(req)
+                                .setPeerErrorHandlingMode()
+                                .setErrorHandler(errHandle)
+                                .setName(s"Endpoint to ${req.getClientId}")
+                        )
+                        connections.put(name, ep)
+                    }
+                }
+                connectionHandler
+            }
+        }
     }
 
     // def send(host: String, header: ByteBuffer, body: ByteBuffer, callback: UcxCallback,

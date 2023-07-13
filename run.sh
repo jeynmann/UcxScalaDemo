@@ -1,23 +1,38 @@
-#!/usr/bin/env sh
+#!/usr/bin/env bash
 
-#  sh run.sh '' 3000 1 500 1
-#  sh run.sh 192.168.20.10:3000 '' 1 500 1
+# cd $(dirname `readlink -f $0`)
 
-export JAVA_HOME=/usr/lib/jvm/TencentKona-8.0.6-292
-export JAVA_LIBRARY_PATH=$JAVA_HOME/jre/lib:$JAVA_HOME/jre/lib/amd64:$JAVA_HOME/jre/lib/amd64/jli:$JAVA_HOME/jre/lib/amd64/server
-export JAVA_OPTS="-Dlog4j.configurationFile=log4j2.xml -XX:MetaspaceSize=40m -XX:+PrintCommandLineFlags -Xmx10g -Xms10g -Djava.library.path=$JAVA_LIBRARY_PATH -XX:+PrintGCDetails -XX:+PrintGCDateStamps -Xloggc:/tmp/gc.log -verbose:gc -XX:SurvivorRatio=4 -XX:+UseMembar -XX:+UseCompressedOops -XX:+IgnoreUnrecognizedVMOptions -XX:+IgnoreNoShareValue -XX:CPUShareScaleFactor=6 -XX:CPUShareScaleLimit=15"
+#  sh run.sh '' 3000 1 16 1
+#  sh run.sh 192.168.20.10:3000 '' 16 1 1
 
-host=$1
-port=$2
+size=$((4*1024))
+lead=$1
+bind=$2
 numClient=$3
 numServer=$4
 numFlight=$5
+log=$6
 
-scala \
-    target/ucx-demo-0.1-for-default-jar-with-dependencies.jar \
-    s=${host:=} \
-    p=${port:=3000} \
-    cli=${numClient:=1} \
-    srv=${numServer:=1} \
-    f=${numFlight=1} \
+arg="$arg -q 0" 
+arg="$arg -x 1"
+arg="$arg -d $size"
+if [ "$lead" ];then
+    arg="$arg -l ${lead} -a ${lead}"
+fi
+if [ "$bind" ];then
+    arg="$arg -b ${bind}"
+fi
+arg="$arg -c ${numClient:=1}"
+arg="$arg -s ${numServer:=1}"
+arg="$arg -f ${numFlight=1}"
+
+if [ $log ];then
+    echo -e run "\e[031mjps|grep demo|cut -d ' ' -f 1|xargs kill\e[0m" if kill
+    java $JAVA_OPTS -cp target -jar \
+        target/ucx-demo-0.1-for-default-jar-with-dependencies.jar $arg \
+ &>$log &
+else
+    java $JAVA_OPTS -cp target -jar \
+        target/ucx-demo-0.1-for-default-jar-with-dependencies.jar $arg
+fi
 

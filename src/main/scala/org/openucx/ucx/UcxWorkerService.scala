@@ -25,17 +25,15 @@ class UcxWorkerService extends AbstractExecutorService {
     private var executors: Array[UcxWorkerWrapper] = _
     private var listener: UcxWorkerWrapper = _
     private var ucpListener: UcpListener = _
-    private var connectionHandler: UcpListenerConnectionHandler = _
     private var connectbackHandler: UcpAmRecvCallback = _
     private var introduceHandler: UcpAmRecvCallback = _
+    private var joiningHandler: UcpAmRecvCallback = _
     private var bClient: Boolean = _
     private var bSequentialConnecting = false
     private var bShutDown = false
     private var bTermed = false
     private var bInit = false
 
-    private final val connections = new TrieMap[String, UcpEndpoint]
-    
     def initServer(n: Int, hostPort: String, handles: Array[(Int, UcpAmRecvCallback, Long)] = null) = {
         bClient = false
         initExecutors(n, null)
@@ -53,17 +51,16 @@ class UcxWorkerService extends AbstractExecutorService {
             for (hostPort <- hostPortList.split(",")) {
                 if (!hostPort.isEmpty) {
                     UcxWorkerService.serverSocket.getOrElseUpdate(hostPort, {
-                        val host = hostPort.split(":")
-                        new InetSocketAddress(host(0), host(1).toInt)
+                        Utils.newInetSocketAddress(hostPort)
                     })
                 }
             }
             if (bSequentialConnecting) {
-                executors.foreach { x => UcxWorkerService.serverSocket.keys.foreach(x.getOrConnect(_)) }
+                executors.foreach { x => UcxWorkerService.serverSocket.keys.foreach(x.connecting(_)) }
             } else {
                 executors.foreach { x =>
                     x.submit(newTaskFor(new Runnable {
-                        override def run = UcxWorkerService.serverSocket.keys.foreach(x.getOrConnect(_))
+                        override def run = UcxWorkerService.serverSocket.keys.foreach(x.connecting(_))
                     }, Unit))
                 }
             }
@@ -86,48 +83,22 @@ class UcxWorkerService extends AbstractExecutorService {
 
     private def initListener(hostPort: String, handles: Array[(Int, UcpAmRecvCallback, Long)]) = {
         val listenAddress = UcxWorkerService.listenSocket.getOrElseUpdate(hostPort, {
-            if (hostPort.contains(":")) {
-                val host = hostPort.split(":")
-                new InetSocketAddress(host(0), host(1).toInt)
-            } else {
-                new InetSocketAddress("0.0.0.0", hostPort.toInt)
-            }
+            Utils.newInetSocketAddress(hostPort)
         })
         Log.debug(s"listener on ${listenAddress}")
-        listener = new UcxWorkerWrapper(UcxWorkerService.ucxContext.newWorker(ucpWorkerParams))
+
+        listener = new UcxWorkerWrapper(UcxWorkerService.ucxContext.newWorker(ucpWorkerParams), 0, hostPort)
         // message handles
         listener.initService(handles)
-        connectionHandler = new UcpListenerConnectionHandler {
-            override def onConnectionRequest(req: UcpConnectionRequest) = {
-                Log.debug(s"Listener $this receive connecting from ${req.getClientId}")
-
-                val ep = listener.worker.newEndpoint(
-                    new UcpEndpointParams()
-                        .setConnectionRequest(req)
-                        .setPeerErrorHandlingMode()
-                        .setErrorHandler(new UcpEndpointErrorHandler {
-                            override def onError(ucpEndpoint: UcpEndpoint, errorCode: Int, errorString: String): Unit = {
-                                if (errorCode == UcsConstants.STATUS.UCS_ERR_CONNECTION_RESET) {
-                                    Log.warn(s"Connection closed on ep: $ucpEndpoint")
-                                } else {
-                                    Log.error(s"Ep $ucpEndpoint got an error: $errorString")
-                                }
-                                UcxWorkerService.endpoints.remove(ucpEndpoint)
-                                ucpEndpoint.close()
-                            }
-                        })
-                        .setName(s"Endpoint to ${req.getClientId}")
-                )
-                UcxWorkerService.endpoints.add(ep)
-            }
-        }
         connectbackHandler = new UcpAmRecvCallback {
             override def onReceive(headerAddress: Long, headerSize: Long, amData: UcpAmData, ep: UcpEndpoint) = {
                 val header = UnsafeUtils.getByteBufferView(headerAddress, headerSize.toInt)
-                val workerAddress = UnsafeUtils.getByteBufferView(amData.getDataAddress, amData.getLength.toInt)
-                val workerName = java.nio.charset.StandardCharsets.UTF_8.decode(header).toString
+                val workerName = Utils.newString(header)
 
-                UcxWorkerService.clientWorker.put(workerName, workerAddress)
+                val workerAddress = UnsafeUtils.getByteBufferView(amData.getDataAddress, amData.getLength.toInt)
+
+                UcxWorkerService.clientWorker.put(workerName, Utils.newBuffer(workerAddress))
+
                 if (bSequentialConnecting) {
                     executors.foreach { x => x.getOrConnectBack(workerName) }
                 } else {
@@ -137,6 +108,7 @@ class UcxWorkerService extends AbstractExecutorService {
                         }, Unit))
                     }
                 }
+                // @attention may should be in progress if not copy amData
                 UcsConstants.STATUS.UCS_OK
             }
         }
@@ -144,36 +116,88 @@ class UcxWorkerService extends AbstractExecutorService {
             UcxAmId.CONNECTION.id, connectbackHandler, UcpConstants.UCP_AM_FLAG_WHOLE_MSG)
         ucpListener = listener.worker.newListener(new UcpListenerParams()
             .setSockAddr(listenAddress)
-            .setConnectionHandler(connectionHandler))
+            .setConnectionHandler(listener.getConnectionHandle))
     }
 
-    /**
-     * allows to handle introduce message
-     */
-    @inline
-    def initIntroduce(clientService: UcxWorkerService): Unit = {
-        Option (clientService) match {
-            case Some(service) => initIntroduceHandle(clientService)
-            case None => Log.warn("initIntroduce with null clientService.")
+    def initCluster(leader: String, clientService: UcxWorkerService): Unit = {
+        if (!leader.isEmpty) {
+            UcxWorkerService.leaderSocket.getOrElseUpdate(
+                leader, Utils.newInetSocketAddress(leader))
         }
+        Option(clientService) match {
+            case Some(service) => {
+                Log.debug(s"launch in cluster mode.")
+                initJoiningHandle(service)
+                initIntroduceHandle(service)
+            }
+            case None => ()
+        }
+    }
+
+    def initJoiningHandle(clientService: UcxWorkerService): Unit = {
+        joiningHandler = new UcpAmRecvCallback {
+            override def onReceive(headerAddress: Long, headerSize: Long, amData: UcpAmData, ep: UcpEndpoint) = {
+                val header = UnsafeUtils.getByteBufferView(headerAddress, headerSize.toInt)
+                val hostName = Utils.newString(header)
+
+                val socketBuffer = UnsafeUtils.getByteBufferView(amData.getDataAddress, amData.getLength.toInt)
+
+                Log.debug(s"Leader $listener receive joining from ${hostName}")
+
+                UcxWorkerService.serverSocket.getOrElseUpdate(hostName, Utils.newInetSocketAddress4(socketBuffer))
+
+                // connect to new member
+                if (bSequentialConnecting) {
+                    clientService.executors.foreach { x => x.connecting(hostName) }
+                    // new member connect existing members
+                    clientService.selectRR.introduceAll(hostName)
+                    // existing members connect to new member
+                    clientService.selectRR.introduce(hostName, socketBuffer)
+                } else {
+                    clientService.executors.foreach { x =>
+                        x.submit(newTaskFor(new Runnable {
+                            override def run = x.connecting(hostName)
+                        }, Unit))
+                    }
+                    clientService.submit(new Runnable {
+                        override def run = UcxWorkerWrapper.get.introduceAll(hostName)
+                    })
+                    clientService.submit(new Runnable {
+                        val copiedBuffer = Utils.newBuffer(socketBuffer)
+                        override def run = UcxWorkerWrapper.get.introduce(hostName, copiedBuffer)
+                    })
+                }
+
+                // done
+                UcsConstants.STATUS.UCS_OK
+            }
+        }
+        listener.worker.setAmRecvHandler(
+            UcxAmId.JOINING.id, joiningHandler, UcpConstants.UCP_AM_FLAG_WHOLE_MSG)
     }
 
     private def initIntroduceHandle(clientService: UcxWorkerService): Unit = {
         introduceHandler = new UcpAmRecvCallback {
             override def onReceive(headerAddress: Long, headerSize: Long, amData: UcpAmData, ep: UcpEndpoint) = {
                 val header = UnsafeUtils.getByteBufferView(headerAddress, headerSize.toInt)
-                val name = java.nio.charset.StandardCharsets.UTF_8.decode(header).toString
-                val socketBuffer = UnsafeUtils.getByteBufferView(amData.getDataAddress, amData.getLength.toInt)
-                val socketPort = socketBuffer.getInt
-                val socketAddress = new InetSocketAddress(java.nio.charset.StandardCharsets.UTF_8.decode(socketBuffer).toString, socketPort)
+                val count = header.getInt
 
-                UcxWorkerService.serverSocket.put(name, socketAddress)
+                val socketBuffer = UnsafeUtils.getByteBufferView(amData.getDataAddress, amData.getLength.toInt)
+                val members = (0 until count).map { _ => {
+                    val socketAddress = Utils.newInetSocketAddress4(socketBuffer)
+                    val name = Utils.newString(socketAddress)
+                    UcxWorkerService.serverSocket.getOrElseUpdate(name, socketAddress)
+                    name
+                }}
+
+                Log.debug(s"Member $listener receive introduce ${members}")
+
                 if (bSequentialConnecting) {
-                    clientService.executors.foreach { x => x.getOrConnect(name) }
+                    clientService.executors.foreach { x => members.foreach(x.connecting(_)) }
                 } else {
                     clientService.executors.foreach { x =>
                         x.submit(newTaskFor(new Runnable {
-                            override def run = x.getOrConnect(name)
+                            override def run = members.foreach(x.connecting(_))
                         }, Unit))
                     }
                 }
@@ -185,23 +209,9 @@ class UcxWorkerService extends AbstractExecutorService {
     }
 
     def connectInSequential(isSeq: Boolean = true): Unit = bSequentialConnecting = isSeq
-    /**
-     * introduce current listener address to all servers
-     */
-    def introduceListener(): Unit = {
-        if (bSequentialConnecting) {
-            executors.foreach { x =>
-                UcxWorkerService.listenSocket.keys.foreach(x.introduceListener(_))
-            }
-        } else {
-            executors.foreach { x =>
-                x.submit(newTaskFor(new Runnable {
-                    override def run = {
-                        UcxWorkerService.listenSocket.keys.foreach(x.introduceListener(_))
-                    }
-                }, Unit))
-            }
-        }
+
+    def joiningCluster(): Unit = {
+        UcxWorkerService.leaderSocket.keys.foreach(listener.following(_))
     }
 
     def run = {
@@ -271,13 +281,14 @@ object UcxWorkerService {
         
     val ucxContext = new UcpContext(ucpParams)
     val listenSocket = new TrieMap[String, InetSocketAddress]
+    val leaderSocket = new TrieMap[String, InetSocketAddress]
     val serverSocket = new TrieMap[String, InetSocketAddress]
     val clientWorker = new TrieMap[String, ByteBuffer]
-    val endpoints = Set.empty[UcpEndpoint]
 }
 
 object UcxAmId extends Enumeration { 
     val CONNECTION = Value
+    val JOINING = Value
     val INTRODUCE = Value
     val FETCH = Value
     val FETCH_REPLY = Value

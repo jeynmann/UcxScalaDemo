@@ -265,7 +265,6 @@ class Client extends Thread {
 
     override def run() = {
         service.run
-        service.introduceListener
         val flight = new AtomicInteger
         for (i <- 0 until iterations) {
             while (!isInterrupted) {
@@ -319,9 +318,7 @@ class FetchMessage {
     def process = {
         try {
             val startTime = System.nanoTime()
-            // Log.warn("<zzh> before close")
-            // ucpAmData.close
-            // Log.warn("<zzh> after close")
+            ucpAmData.close
             // allocate data
             val headerSize = UnsafeUtils.INT_SIZE
             val bodySize = body
@@ -363,26 +360,29 @@ class Server extends Thread {
             val m = new FetchMessage()
             m.parse(headerAddress, headerSize, amData)
             outStandings.offer(m)
-            // submit reply task
-            UcsConstants.STATUS.UCS_OK
+            // release amData in next task
+            UcsConstants.STATUS.UCS_INPROGRESS
         }
     }
     private val handles = Array[(Int, UcpAmRecvCallback, Long)](
         (UcxAmId.FETCH.id, fetchHandle, UcpConstants.UCP_AM_FLAG_PERSISTENT_DATA | UcpConstants.UCP_AM_FLAG_WHOLE_MSG))
-    // UcpConstants.UCP_AM_FLAG_PERSISTENT_DATA | 
 
     val service = new UcxWorkerService()
+    var bindAddress: String = _
+    var leaderAddress: String = _
 
-    def init(n: Int, hostPort: String) = {
+    def init(n: Int, hostPort: String, leader: String, client: Client) = {
+        bindAddress = hostPort
+        leaderAddress = leader
         service.initServer(n, hostPort, handles)
-    }
-
-    def initIntroduce(client: Client) = {
-        service.initIntroduce(client.service)
+        service.initCluster(leader, client.service)
     }
 
     override def run() = {
         service.run
+        if (!leaderAddress.isEmpty) {
+            service.joiningCluster()
+        }
         while (!isInterrupted) {
             Option(outStandings.poll) match {
                 case Some(msg) => service.submit(new Runnable {
@@ -410,6 +410,7 @@ object Demo {
         options.addOption("d", "message-size", true, "size of message to transfer. Default: 4194304")
         options.addOption("f", "num-reqs-inflight", true, "number of requests in flight. Default: 16")
         options.addOption("h", "help", false, "display help message")
+        options.addOption("l", "leader address", true, "join a cluster through this endpoint. Format: host:port. Default: ")
         options.addOption("n", "num-iterations", true, "number of iterations. Default: 99999999")
         options.addOption("q", "sequential-connect", true, "connects in sequential order. Default: 0")
         options.addOption("s", "num-servers", true, "Number of servers. Default: 16")
@@ -422,6 +423,7 @@ object Demo {
         }
 
         val hosts = cmd.getOptionValue("a","")
+        val leader = cmd.getOptionValue("l","")
         val listener = cmd.getOptionValue("b","3000")
         val iterations = cmd.getOptionValue("n","99999999").toInt
         val msgSize = cmd.getOptionValue("d","4194304").toInt
@@ -432,6 +434,7 @@ object Demo {
         val biDirection =cmd.getOptionValue("x","0").toInt
 
         println(s"hosts=${hosts}")
+        println(s"leader=${leader}")
         println(s"listener=${listener}")
         println(s"iterations=${iterations}")
         println(s"msgSize=${msgSize}")
@@ -442,15 +445,6 @@ object Demo {
 
         NativeLibs.load()
 
-        val server = if ((biDirection != 0) || (!listener.isEmpty)) {
-            val srv = new Server
-            srv.init(numServers, listener)
-            srv.service.connectInSequential(seqConnect != 0)
-            srv
-        } else {
-            null
-        }
-
         val client = if ((biDirection != 0) || (!hosts.isEmpty)) {
             val cli = new Client
             cli.init(numClients, hosts, numFlights, iterations, msgSize)
@@ -460,8 +454,16 @@ object Demo {
             null
         }
 
+        val server = if ((biDirection != 0) || (!listener.isEmpty)) {
+            val srv = new Server
+            srv.init(numServers, listener, leader, client)
+            srv.service.connectInSequential(seqConnect != 0)
+            srv
+        } else {
+            null
+        }
+
         if ((biDirection != 0) || (server != null && client != null)) {
-            server.initIntroduce(client)
             server.start
             client.run
             server.close
