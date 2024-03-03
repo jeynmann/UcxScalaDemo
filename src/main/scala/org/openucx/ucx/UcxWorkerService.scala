@@ -285,9 +285,9 @@ object UcxAmId extends Enumeration {
 
 object Log {
     val log = LogManager.getLogger(UcxWorkerService.getClass)
-    def error(buf: String) = log.error(buf)
-    def info(buf: String) = log.info(buf)
-    def warn(buf: String) = log.warn(buf)
-    def debug(buf: String) = log.debug(buf)
-    def trace(buf: String) = log.trace(buf)
+    def error(buf: () => String) = log.error(buf)
+    def info(buf: () => String) = log.info(buf)
+    def warn(buf: () => String) = log.warn(buf)
+    def debug(buf: () => String) = log.debug(buf)
+    def trace(buf: () => String) = log.trace(buf)
 }

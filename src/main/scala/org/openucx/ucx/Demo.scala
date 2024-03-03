@@ -175,7 +175,7 @@ class RecvMessage {
             val amStartTime = System.nanoTime()
             val buff = ByteBuffer.allocateDirect(ucpAmData.getLength.toInt)
             val buffAddress = UcxUtils.getAddress(buff)
-            UcxWorkerWrapper.get.worker.recvAmDataNonBlocking(ucpAmData.getDataHandle, buffAddress, buff.limit,
+            UcxWorkerWrapper.get.worker.recvAmDataNonBlocking(ucpAmData.getDataHandle, buffAddress, buff.limit(),
                 new UcxCallback() {
                     override def onSuccess(r: UcpRequest): Unit = {
                         Log.trace(s"AmHandleTime for flightId $fid is ${System.nanoTime() - amStartTime} ns")

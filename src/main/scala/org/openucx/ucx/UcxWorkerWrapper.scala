@@ -193,7 +193,9 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
 
     @inline
     def close(): Unit = {
-        Log.debug((s"Worker-$id closing"))
+        Log.debug((s"Worker-$id close"))
+        interrupt
+        join(10)
         val reqs = connections.map {
             case (_, endpoint) => endpoint.closeNonBlockingForce()
         }

@@ -39,7 +39,7 @@ See file LICENSE for terms.
       <properties>
         <scala.version>2.11.12</scala.version>
         <scala.compat.version>2.11</scala.compat.version>
-        <ucx.version>1.16.0</ucx.version>
+        <ucx.version>1.13.1</ucx.version>
         <log4j2.version>2.6.2</log4j2.version>
       </properties>
       <build>
