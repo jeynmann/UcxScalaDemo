@@ -15,15 +15,15 @@ import org.openucx.jucx.ucs.UcsConstants.MEMORY_TYPE
 import org.apache.logging.log4j.LogManager;
 
 
-class UcxWorkerService extends AbstractExecutorService {
+class UcxService extends AbstractExecutorService {
     val id = new AtomicInteger()
     private val ucpWorkerParams = new UcpWorkerParams()
             .requestThreadSafety()
             .requestWakeupRX()
             .requestWakeupTX()
             .requestWakeupEdge()
-    private var executors: Array[UcxWorkerWrapper] = _
-    private var listener: UcxWorkerWrapper = _
+    private var executors: Array[UcxWorker] = _
+    private var listener: UcxWorker = _
     private var ucpListener: UcpListener = _
     private var connectionHandler: UcpListenerConnectionHandler = _
     private var connectbackHandler: UcpAmRecvCallback = _
@@ -52,18 +52,18 @@ class UcxWorkerService extends AbstractExecutorService {
         if (!hostPortList.isEmpty) {
             for (hostPort <- hostPortList.split(",")) {
                 if (!hostPort.isEmpty) {
-                    UcxWorkerService.serverSocket.getOrElseUpdate(hostPort, {
+                    UcxService.serverSocket.getOrElseUpdate(hostPort, {
                         val host = hostPort.split(":")
                         new InetSocketAddress(host(0), host(1).toInt)
                     })
                 }
             }
             if (bSequentialConnecting) {
-                executors.foreach { x => UcxWorkerService.serverSocket.keys.foreach(x.getOrConnect(_)) }
+                executors.foreach { x => UcxService.serverSocket.keys.foreach(x.getOrConnect(_)) }
             } else {
                 executors.foreach { x =>
                     x.submit(newTaskFor(new Runnable {
-                        override def run = UcxWorkerService.serverSocket.keys.foreach(x.getOrConnect(_))
+                        override def run = UcxService.serverSocket.keys.foreach(x.getOrConnect(_))
                     }, Unit))
                 }
             }
@@ -73,19 +73,19 @@ class UcxWorkerService extends AbstractExecutorService {
 
     private def initExecutors(n: Int, handles: Array[(Int, UcpAmRecvCallback, Long)]) = {
         val shift = if (bClient) 32 else 0
-        executors = new Array[UcxWorkerWrapper](n)
+        executors = new Array[UcxWorker](n)
         for (i <- 0 until n) {
             val id = (i + 1).toLong << shift
             if (bClient) {
                 ucpWorkerParams.setClientId(id)
             }
-            executors(i) = new UcxWorkerWrapper(UcxWorkerService.ucxContext.newWorker(ucpWorkerParams), id)
+            executors(i) = new UcxWorker(UcxService.ucxContext.newWorker(ucpWorkerParams), id)
             executors(i).initService(handles)
         }
     }
 
     private def initListener(hostPort: String, handles: Array[(Int, UcpAmRecvCallback, Long)]) = {
-        val listenAddress = UcxWorkerService.listenSocket.getOrElseUpdate(hostPort, {
+        val listenAddress = UcxService.listenSocket.getOrElseUpdate(hostPort, {
             if (hostPort.contains(":")) {
                 val host = hostPort.split(":")
                 new InetSocketAddress(host(0), host(1).toInt)
@@ -94,7 +94,7 @@ class UcxWorkerService extends AbstractExecutorService {
             }
         })
         Log.debug(s"listener on ${listenAddress}")
-        listener = new UcxWorkerWrapper(UcxWorkerService.ucxContext.newWorker(ucpWorkerParams))
+        listener = new UcxWorker(UcxService.ucxContext.newWorker(ucpWorkerParams))
         // message handles
         listener.initService(handles)
         connectionHandler = new UcpListenerConnectionHandler {
@@ -112,13 +112,13 @@ class UcxWorkerService extends AbstractExecutorService {
                                 } else {
                                     Log.error(s"Ep $ucpEndpoint got an error: $errorString")
                                 }
-                                UcxWorkerService.endpoints.remove(ucpEndpoint)
+                                UcxService.endpoints.remove(ucpEndpoint)
                                 ucpEndpoint.close()
                             }
                         })
                         .setName(s"Endpoint to ${req.getClientId}")
                 )
-                UcxWorkerService.endpoints.add(ep)
+                UcxService.endpoints.add(ep)
             }
         }
         connectbackHandler = new UcpAmRecvCallback {
@@ -127,7 +127,7 @@ class UcxWorkerService extends AbstractExecutorService {
                 val workerAddress = UnsafeUtils.getByteBufferView(amData.getDataAddress, amData.getLength.toInt)
                 val workerName = java.nio.charset.StandardCharsets.UTF_8.decode(header).toString
 
-                UcxWorkerService.clientWorker.put(workerName, workerAddress)
+                UcxService.clientWorker.put(workerName, workerAddress)
                 if (bSequentialConnecting) {
                     executors.foreach { x => x.getOrConnectBack(workerName) }
                 } else {
@@ -151,14 +151,14 @@ class UcxWorkerService extends AbstractExecutorService {
      * allows to handle introduce message
      */
     @inline
-    def initIntroduce(clientService: UcxWorkerService): Unit = {
+    def initIntroduce(clientService: UcxService): Unit = {
         Option (clientService) match {
             case Some(service) => initIntroduceHandle(clientService)
             case None => Log.warn("initIntroduce with null clientService.")
         }
     }
 
-    private def initIntroduceHandle(clientService: UcxWorkerService): Unit = {
+    private def initIntroduceHandle(clientService: UcxService): Unit = {
         introduceHandler = new UcpAmRecvCallback {
             override def onReceive(headerAddress: Long, headerSize: Long, amData: UcpAmData, ep: UcpEndpoint) = {
                 val header = UnsafeUtils.getByteBufferView(headerAddress, headerSize.toInt)
@@ -167,7 +167,7 @@ class UcxWorkerService extends AbstractExecutorService {
                 val socketPort = socketBuffer.getInt
                 val socketAddress = new InetSocketAddress(java.nio.charset.StandardCharsets.UTF_8.decode(socketBuffer).toString, socketPort)
 
-                UcxWorkerService.serverSocket.put(name, socketAddress)
+                UcxService.serverSocket.put(name, socketAddress)
                 if (bSequentialConnecting) {
                     clientService.executors.foreach { x => x.getOrConnect(name) }
                 } else {
@@ -191,13 +191,13 @@ class UcxWorkerService extends AbstractExecutorService {
     def introduceListener(): Unit = {
         if (bSequentialConnecting) {
             executors.foreach { x =>
-                UcxWorkerService.listenSocket.keys.foreach(x.introduceListener(_))
+                UcxService.listenSocket.keys.foreach(x.introduceListener(_))
             }
         } else {
             executors.foreach { x =>
                 x.submit(newTaskFor(new Runnable {
                     override def run = {
-                        UcxWorkerService.listenSocket.keys.foreach(x.introduceListener(_))
+                        UcxService.listenSocket.keys.foreach(x.introduceListener(_))
                     }
                 }, Unit))
             }
@@ -262,7 +262,7 @@ class UcxWorkerService extends AbstractExecutorService {
     } 
 }
 
-object UcxWorkerService {
+object UcxService {
     val ucpParams = new UcpParams()
         .requestAmFeature()
         .setMtWorkersShared(true)
@@ -284,10 +284,10 @@ object UcxAmId extends Enumeration {
 }
 
 object Log {
-    val log = LogManager.getLogger(UcxWorkerService.getClass)
-    def error(buf: () => String) = log.error(buf)
-    def info(buf: () => String) = log.info(buf)
-    def warn(buf: () => String) = log.warn(buf)
-    def debug(buf: () => String) = log.debug(buf)
-    def trace(buf: () => String) = log.trace(buf)
+    val log = LogManager.getLogger(UcxService.getClass)
+    def error(buf: => String) = log.error(buf)
+    def info(buf: => String) = log.info(buf)
+    def warn(buf: => String) = log.warn(buf)
+    def debug(buf: => String) = log.debug(buf)
+    def trace(buf: => String) = log.trace(buf)
 }
