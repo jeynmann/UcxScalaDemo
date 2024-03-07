@@ -251,7 +251,7 @@ class UcxWorker(val worker: UcpWorker, id: Long = 0) extends Closeable with Logg
     if (amData.isDataValid) {
       val amBuf = BufferUtils.makeByteBuffer(amData.getDataAddress, amData.getLength.toInt)
       rxHandlers.get(rxId).map(_.onReceive(amBuf))
-      logDebug(s"${id}-${rxId} recv success: $amData")
+      logDebug(s"Worker ${id} rx ${rxId} recv success: $amBuf")
     } else {
       val recvBuf = ByteBuffer.allocateDirect(amData.getLength.toInt)
       val recvPtr = BufferUtils.address(recvBuf)
@@ -260,10 +260,10 @@ class UcxWorker(val worker: UcpWorker, id: Long = 0) extends Closeable with Logg
         new UcxCallback {
             override def onSuccess(request: UcpRequest): Unit = {
               rxHandlers.get(rxId).map(_.onReceive(recvBuf))
-              logDebug(s"${id}-${rxId} recv success: $request")
+              logDebug(s"Worker ${id} rx ${rxId} recv success: $recvBuf")
             }
             override def onError(ucsStatus: Int, errorMsg: String): Unit = {
-              logError(s"${id}-${rxId} recv failed: $errorMsg")
+              logError(s"Worker ${id} rx ${rxId} recv failed: $errorMsg")
             }
         }, MEMORY_TYPE.UCS_MEMORY_TYPE_HOST)
     }

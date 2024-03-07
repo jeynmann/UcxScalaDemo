@@ -88,6 +88,7 @@ object Demo extends Logging {
         while (msg.remaining() > 0) {
             msg.putChar(('A' + (msg.remaining() & 15)).toChar)
         }
+        msg.rewind()
 
         val handle = new UcxHandler {
             override def onReceive(endpoint: UcxEndpoint, msg: ByteBuffer): Unit = {
