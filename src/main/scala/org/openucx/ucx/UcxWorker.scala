@@ -3,7 +3,7 @@ package org.openucx.ucx
 import java.lang.management.ManagementFactory
 import java.net.InetAddress
 import java.nio.ByteBuffer
-import java.util.concurrent.{RunnableFuture, FutureTask, TimeUnit, ConcurrentLinkedQueue, Semaphore}
+import java.util.concurrent.{TimeUnit, ConcurrentLinkedQueue, Semaphore}
 import java.util.concurrent.atomic.AtomicInteger
 
 import scala.collection.concurrent.TrieMap
@@ -14,12 +14,12 @@ import org.openucx.jucx.ucs.UcsConstants
 import org.openucx.jucx.ucs.UcsConstants.MEMORY_TYPE
 import org.openucx.jucx.{UcxCallback, UcxException, UcxUtils}
 
-class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
+class UcxWorker(val worker: UcpWorker, id: Long = 0) extends Thread {
     // private val hostName = InetAddress.getLocalHost.getHostName
     private val uniName = s"${ManagementFactory.getRuntimeMXBean.getName}#$id"
 
     private var taskLimit: Semaphore = null
-    private val taskQueue = new ConcurrentLinkedQueue[RunnableFuture[_]]()
+    private val taskQueue = new ConcurrentLinkedQueue[Runnable]()
 
     private val connections = new TrieMap[String, UcpEndpoint]
 
@@ -53,7 +53,7 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
 
     def getOrConnectBack(host: String): UcpEndpoint = {
         connections.getOrElseUpdate(host,  {
-            val workerAddress = UcxWorkerService.clientWorker(host)
+            val workerAddress = UcxService.clientWorker(host)
 
             Log.debug(s"Server $this connecting to client($host, $workerAddress)")
 
@@ -73,7 +73,7 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
 
     def getOrConnect(host: String): UcpEndpoint = {
         connections.getOrElseUpdate(host,  {
-            val socketAddress = UcxWorkerService.serverSocket(host)
+            val socketAddress = UcxService.serverSocket(host)
             val endpointParams = new UcpEndpointParams()
                 .setPeerErrorHandlingMode()
                 .setSocketAddress(socketAddress)
@@ -95,8 +95,8 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
             header.rewind()
 
             ep.sendAmNonBlocking(UcxAmId.CONNECTION.id,
-                UcxUtils.getAddress(header), header.limit,
-                UcxUtils.getAddress(workerAddress), workerAddress.limit,
+                UcxUtils.getAddress(header), header.limit(),
+                UcxUtils.getAddress(workerAddress), workerAddress.limit(),
                 UcpConstants.UCP_AM_SEND_FLAG_EAGER,
                 new UcxCallback {
                     override def onSuccess(request: UcpRequest): Unit = {
@@ -106,6 +106,34 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
                 }, MEMORY_TYPE.UCS_MEMORY_TYPE_HOST)
             ep
         })
+    }
+
+    def introduceListener(host: String): Unit = {
+        connections.foreach { case (name, ep) => {
+            val socketAddress = UcxService.listenSocket(host)
+            val hostAddress = socketAddress.getAddress.getHostAddress
+            val hostPort = socketAddress.getPort
+            
+            Log.debug(s"Client $this introduce ($host) to server ($name)")
+            
+            val headerSize = host.size
+            val bodySize = UnsafeUtils.INT_SIZE + hostAddress.size
+            val buf = ByteBuffer.allocateDirect(headerSize + bodySize)
+            val bufAddress = UcxUtils.getAddress(buf)
+            buf.put(host.getBytes)
+            buf.putInt(hostPort)
+            buf.put(hostAddress.getBytes)
+            buf.rewind()
+            
+            ep.sendAmNonBlocking(UcxAmId.INTRODUCE.id,
+                bufAddress, headerSize, bufAddress + headerSize, bodySize,
+                UcpConstants.UCP_AM_SEND_FLAG_EAGER,
+                new UcxCallback {
+                    override def onSuccess(request: UcpRequest): Unit = {
+                        buf.clear()
+                    }
+                }, MEMORY_TYPE.UCS_MEMORY_TYPE_HOST)
+        }}
     }
 
     // def send(host: String, header: ByteBuffer, body: ByteBuffer, callback: UcxCallback,
@@ -126,15 +154,12 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
 
     override def run(): Unit = {
         Log.debug((s"Worker-$id start"))
-        UcxWorkerWrapper.set(this)
+        UcxWorker.set(this)
         while (!isInterrupted) {
             Option(taskQueue.poll()) match {
                 case Some(task) => {
                     task.run
-                    Option(taskLimit) match {
-                        case Some(sem) => sem.release
-                        case None => ()
-                    }
+                    release
                 }
                 case None => {}
             }
@@ -143,22 +168,34 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
                 worker.waitForEvents()
             }
         }
-        UcxWorkerWrapper.set(null)
+        UcxWorker.set(null)
         Log.debug((s"Worker-$id stop"))
     }
 
     @inline
-    def submit(task: RunnableFuture[_]) = {
-        Option(taskLimit) match {
-            case Some(sem) => sem.acquire
-            case None => ()
-        }
+    def acquire(): Unit = Option(taskLimit) match {
+        case Some(sem) => sem.acquire
+        case None => ()
+    }
+
+    @inline
+    def release(): Unit = Option(taskLimit) match {
+        case Some(sem) => sem.release
+        case None => ()
+    }
+
+    @inline
+    def submit(task: Runnable) = {
+        acquire
         taskQueue.offer(task)
         worker.signal()
     }
 
     @inline
     def close(): Unit = {
+        Log.debug((s"Worker-$id close"))
+        interrupt
+        join(10)
         val reqs = connections.map {
             case (_, endpoint) => endpoint.closeNonBlockingForce()
         }
@@ -167,13 +204,14 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
         }
         connections.clear()
         worker.close()
+        Log.debug((s"Worker-$id closed"))
     }
 }
 
-object UcxWorkerWrapper {
-    private val localWorker = new ThreadLocal[UcxWorkerWrapper]
-    private def set(worker: UcxWorkerWrapper) = {
+object UcxWorker {
+    private val localWorker = new ThreadLocal[UcxWorker]
+    private def set(worker: UcxWorker) = {
         localWorker.set(worker)
     }
-    def get: UcxWorkerWrapper = localWorker.get
+    def get: UcxWorker = localWorker.get
 }

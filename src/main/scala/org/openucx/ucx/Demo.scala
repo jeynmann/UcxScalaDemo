@@ -14,6 +14,7 @@ import org.openucx.jucx.ucs.UcsConstants.MEMORY_TYPE
 import org.openucx.jucx.{UcxCallback, UcxException, UcxUtils}
 import org.openucx.jucx.NativeLibs
 
+import org.apache.commons.cli.{GnuParser, HelpFormatter, Options}
 trait Monitor {
     def add(x: Int): Unit
     def aggregate(): Unit
@@ -22,7 +23,7 @@ trait Monitor {
 class PpsMonitor(name: String, count: Int = 100) extends Monitor {
     private val aggrLocalRecord = new TrieMap[Long, Array[Int]]
     private val aggrLocalId = new TrieMap[Long, AtomicInteger]
-    private val aggrOldId = new TrieMap[Long,Int]
+    private val aggrOldId = new TrieMap[Long, Int]
     
     private val localRecord = new ThreadLocal[Array[Int]] {
         override def initialValue = {
@@ -74,9 +75,9 @@ class PpsMonitor(name: String, count: Int = 100) extends Monitor {
             return 
         }
         val avg = records.sum / records.size
-        val v50 = records((records.size - 1) * 50 / 100)
-        val v80 = records((records.size - 1) * 80 / 100)
-        val v99 = records((records.size - 1) * 99 / 100)
+        val v50 = records(records.size * 50 / 100)
+        val v80 = records(records.size * 80 / 100)
+        val v99 = records(records.size * 99 / 100)
         Log.info(s"$name (average,50%,80%,99%)=($avg,$v50,$v80,$v99)")
     }
 }
@@ -137,7 +138,7 @@ class MonitorThread(time: Int = 1000) extends Thread {
         monitors(name)
     }
 
-    def close = sleeper.release
+    def release = sleeper.release
 
     override def run() = {
         while(!isInterrupted) {
@@ -174,7 +175,7 @@ class RecvMessage {
             val amStartTime = System.nanoTime()
             val buff = ByteBuffer.allocateDirect(ucpAmData.getLength.toInt)
             val buffAddress = UcxUtils.getAddress(buff)
-            UcxWorkerWrapper.get.worker.recvAmDataNonBlocking(ucpAmData.getDataHandle, buffAddress, buff.limit,
+            UcxWorker.get.worker.recvAmDataNonBlocking(ucpAmData.getDataHandle, buffAddress, buff.limit(),
                 new UcxCallback() {
                     override def onSuccess(r: UcpRequest): Unit = {
                         Log.trace(s"AmHandleTime for flightId $fid is ${System.nanoTime() - amStartTime} ns")
@@ -188,11 +189,11 @@ class RecvMessage {
 }
 
 class Client extends Thread {
-    private val service = new UcxWorkerService()
     private val callbacks =  new TrieMap[Long, RunnableFuture[_]]
+    private val bwMonitor = Global.monitor.get("ReadBW")
+    private val latMonitor = Global.monitor.get("ReadLat")
 
-    val bwMonitor = Global.monitor.get("ReadBW")
-    val latMonitor = Global.monitor.get("ReadLat")
+    val service = new UcxService()
 
     private val recvHandle = new UcpAmRecvCallback {
         override def onReceive(headerAddress: Long, headerSize: Long, ucpAmData: UcpAmData, ep: UcpEndpoint) = {
@@ -208,7 +209,7 @@ class Client extends Thread {
         }
     }
     private val handles = Array[(Int, UcpAmRecvCallback, Long)](
-        (UcxAmId.FETCH_REPLY.id, recvHandle, UcpConstants.UCP_AM_FLAG_WHOLE_MSG))
+        (UcxAmId.FETCH_REPLY.id, recvHandle, UcpConstants.UCP_AM_FLAG_PERSISTENT_DATA | UcpConstants.UCP_AM_FLAG_WHOLE_MSG))
 
     private var flightLimit: Semaphore = null
     private var iterations = 0
@@ -225,7 +226,7 @@ class Client extends Thread {
 
     def fetch(fid: Int, host: String, expect: Int) = {
         val startTime = System.nanoTime()
-        val worker = UcxWorkerWrapper.get
+        val worker = UcxWorker.get
         val ep = worker.getOrConnect(host)
 
         val headerSize = UnsafeUtils.INT_SIZE + worker.workerName.size
@@ -246,10 +247,7 @@ class Client extends Thread {
                     latMonitor.add((timecost / 1000000).toInt)
                     Log.trace(s"Total time for flightId $fid size $expect is " + 
                         s"${timecost} ns")
-                    Option(flightLimit) match {
-                        case Some(sem) => sem.release
-                        case None => ()
-                    }
+                    release
                 }
             }, Unit))
         // send to fetch
@@ -267,14 +265,12 @@ class Client extends Thread {
 
     override def run() = {
         service.run
+        service.introduceListener
         val flight = new AtomicInteger
         for (i <- 0 until iterations) {
             while (!isInterrupted) {
-                UcxWorkerService.serverSocket.keys.flatMap { x => {
-                    Option(flightLimit) match {
-                        case Some(sem) => sem.acquire
-                        case None => ()
-                    }
+                UcxService.serverSocket.keys.flatMap { x => {
+                    acquire
                     Seq(service.submit(new Runnable {
                         override def run = fetch(flight.getAndIncrement, x, mesgSize)
                     }))
@@ -282,6 +278,18 @@ class Client extends Thread {
             }
         }
         service.shutdown
+    }
+
+    @inline
+    def acquire = Option(flightLimit) match {
+        case Some(sem) => sem.acquire
+        case None => ()
+    }
+
+    @inline
+    def release = Option(flightLimit) match {
+        case Some(sem) => sem.release
+        case None => ()
     }
 
     def close() = {
@@ -305,14 +313,15 @@ class FetchMessage {
         workerName = java.nio.charset.StandardCharsets.UTF_8.decode(header).toString
         body = message.getInt
         ucpAmData = amData
+        // ucpAmData.close
     }
 
     def process = {
         try {
             val startTime = System.nanoTime()
-            // println("before")
+            // Log.warn("<zzh> before close")
             // ucpAmData.close
-            // println("after")
+            // Log.warn("<zzh> after close")
             // allocate data
             val headerSize = UnsafeUtils.INT_SIZE
             val bodySize = body
@@ -325,7 +334,7 @@ class FetchMessage {
             buffer.put(message)
             buffer.rewind
             //  send fetch reply
-            val worker = UcxWorkerWrapper.get
+            val worker = UcxWorker.get
             val ep = worker.getOrConnectBack(workerName)
             val address = UnsafeUtils.getAdress(buffer)
             ep.sendAmNonBlocking(UcxAmId.FETCH_REPLY.id,
@@ -349,9 +358,7 @@ class FetchMessage {
 
 class Server extends Thread {
     private val outStandings =  new LinkedBlockingDeque[FetchMessage]
-    private val service = new UcxWorkerService()
-
-    val fetchHandle = new UcpAmRecvCallback {
+    private val fetchHandle = new UcpAmRecvCallback {
         override def onReceive(headerAddress: Long, headerSize: Long, amData: UcpAmData, ep: UcpEndpoint) = {
             val m = new FetchMessage()
             m.parse(headerAddress, headerSize, amData)
@@ -361,11 +368,17 @@ class Server extends Thread {
         }
     }
     private val handles = Array[(Int, UcpAmRecvCallback, Long)](
-        (UcxAmId.FETCH.id, fetchHandle, UcpConstants.UCP_AM_FLAG_WHOLE_MSG))
+        (UcxAmId.FETCH.id, fetchHandle, UcpConstants.UCP_AM_FLAG_PERSISTENT_DATA | UcpConstants.UCP_AM_FLAG_WHOLE_MSG))
     // UcpConstants.UCP_AM_FLAG_PERSISTENT_DATA | 
+
+    val service = new UcxService()
 
     def init(n: Int, hostPort: String) = {
         service.initServer(n, hostPort, handles)
+    }
+
+    def initIntroduce(client: Client) = {
+        service.initIntroduce(client.service)
     }
 
     override def run() = {
@@ -388,70 +401,81 @@ class Server extends Thread {
 
 object Demo {
     def main(args:Array[String]) = {
-        val argsMap = parseArgs(args)
-        val listen = argsMap.getOrElseUpdate("p", "3000");
-        val hosts = argsMap.getOrElseUpdate("s","");
-        val iterations = argsMap.getOrElseUpdate("n","99999999").toInt;
-        val msgSize = argsMap.getOrElseUpdate("d", "4194304").toInt;
-        val numFlights = argsMap.getOrElseUpdate("f", "16").toInt;
-        val numClients = argsMap.getOrElseUpdate("cli", "16").toInt;
-        val numServers = argsMap.getOrElseUpdate("srv", "16").toInt;
+        val parser = new GnuParser()
+        val options = new Options()
 
-        println(s"listen=${listen}")
+        options.addOption("a", "address", true, "remote hosts. Format: host1:port1,host2:port2. Default: ")
+        options.addOption("b", "bind", true, "listener address. Default: 0.0.0.0:3000")
+        options.addOption("c", "num-clients", true, "Number of clients. Default: 16")
+        options.addOption("d", "message-size", true, "size of message to transfer. Default: 4194304")
+        options.addOption("f", "num-reqs-inflight", true, "number of requests in flight. Default: 16")
+        options.addOption("h", "help", false, "display help message")
+        options.addOption("n", "num-iterations", true, "number of iterations. Default: 99999999")
+        options.addOption("q", "sequential-connect", true, "connects in sequential order. Default: 0")
+        options.addOption("s", "num-servers", true, "Number of servers. Default: 16")
+        options.addOption("x", "client-server", true, "launch both client and server. Default: 0")
+
+        val cmd = parser.parse(options, args)
+        if (cmd.hasOption("h")) {
+            new HelpFormatter().printHelp("UcxScalaDemo", options)
+            System.exit(0)
+        }
+
+        val hosts = cmd.getOptionValue("a","")
+        val listener = cmd.getOptionValue("b","3000")
+        val iterations = cmd.getOptionValue("n","99999999").toInt
+        val msgSize = cmd.getOptionValue("d","4194304").toInt
+        val numFlights = cmd.getOptionValue("f","16").toInt
+        val numClients = cmd.getOptionValue("c","16").toInt
+        val numServers = cmd.getOptionValue("s","16").toInt
+        val seqConnect =cmd.getOptionValue("q","0").toInt
+        val biDirection =cmd.getOptionValue("x","0").toInt
+
         println(s"hosts=${hosts}")
+        println(s"listener=${listener}")
         println(s"iterations=${iterations}")
         println(s"msgSize=${msgSize}")
+        println(s"numFlights=${numFlights}")
         println(s"numClients=${numClients}")
         println(s"numServers=${numServers}")
-        println(s"numFlights=${numFlights}")
+        println(s"seqConnect=${seqConnect}")
 
         NativeLibs.load()
 
-        if (!hosts.isEmpty) {
-            val client = new Client
-            client.init(numClients, hosts, numFlights, iterations, msgSize)
-            if (!listen.isEmpty)
-                client.start
-            else
-                client.run
+        val server = if ((biDirection != 0) || (!listener.isEmpty)) {
+            val srv = new Server
+            srv.init(numServers, listener)
+            srv.service.connectInSequential(seqConnect != 0)
+            srv
+        } else {
+            null
         }
 
-        if (!listen.isEmpty) {
-            val server = new Server
-            server.init(numServers, listen)
+        val client = if ((biDirection != 0) || (!hosts.isEmpty)) {
+            val cli = new Client
+            cli.init(numClients, hosts, numFlights, iterations, msgSize)
+            cli.service.connectInSequential(seqConnect != 0)
+            cli
+        } else {
+            null
+        }
+
+        if ((biDirection != 0) || (server != null && client != null)) {
+            server.initIntroduce(client)
+            server.start
+            client.run
+            server.close
+            client.close
+        } else if (server != null) {
             server.run
+            server.close
+        } else {
+            client.run
+            client.close
         }
 
-        Global.monitor.close
+        Global.monitor.interrupt
+        Global.monitor.release
+        Global.monitor.join(10)
     }
-
-    def parseArgs(args: Array[String]): Map[String,String] = {
-        val argsMap = Map.empty[String,String]
-        for (arg <- args) {
-            if (arg.contains("h")) {
-                println(DESCRIPTION)
-                return argsMap
-            }
-        }
-        for (arg <- args) {
-            val kv = arg.split("=")
-            if (kv.size == 2) {
-                argsMap.put(kv(0), kv(1))
-            } else if (kv.size == 1) {
-                argsMap.put(kv(0), "")
-            }
-        }
-        argsMap
-    }
-
-    val DESCRIPTION = "JUCX benchmark.\n" +
-        "Run: \n" +
-        "scala -jar target/ucx-demo-0.1-for-default-jar-with-dependencies.jar" +
-        "[p=port] [s=host1:port1,host2:port2] [n=number of iterations] [d=size to transfer] \n\n" +
-        "Parameters:\n" +
-        "h - print help\n" +
-        "s - IP address to bind fetcher listener (default: 0.0.0.0)\n" +
-        "p - port to bind fetcher listener (default: 54321)\n" +
-        "d - total size in bytes to transfer from fetcher to receiver (default 10000)\n" +
-        "n - number of iterations (default 5)\n";
 }
