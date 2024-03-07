@@ -31,13 +31,14 @@ class UcxWorker(val worker: UcpWorker, id: Long = 0) extends Closeable with Logg
     override def onError(ep: UcpEndpoint, ecode: Int, err: String): Unit = {
       connectedEps.remove(ep).map(ucxEp => {
         val address = ucxEp.address
+        val rxId = ucxEp.rxId
         if (ecode == STATUS.UCS_ERR_CONNECTION_RESET) {
-          logInfo(s"Connection to $address closed.")
+          logInfo(s"Connection to $address rx $rxId closed.")
         } else {
-          logWarning(s"Connection to $address error: $err")
+          logWarning(s"Connection to $address rx $rxId error: $err")
         }
         connectedSAs.remove(address)
-        rxHandlers.remove(ucxEp.rxId).map(handler =>
+        rxHandlers.remove(rxId).map(handler =>
             logInfo(s"Remove $handler of $address."))
         ep.close()
       })
@@ -179,6 +180,10 @@ class UcxWorker(val worker: UcpWorker, id: Long = 0) extends Closeable with Logg
     val f = new FutureTask(task, Unit)
     executor.post(f)
     f
+  }
+
+  private[ucx] def post(task: Runnable): Unit = {
+    executor.post(task)
   }
 
   private[ucx] def progress(req: UcpRequest): Unit = {

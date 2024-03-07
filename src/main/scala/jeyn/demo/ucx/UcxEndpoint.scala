@@ -63,7 +63,7 @@ class UcxEndpoint(worker: UcxWorker) extends Closeable with Logging {
     remote = address
   }
 
-  def send(msg: ByteBuffer): UcxReq = {
+  def send(msg: ByteBuffer): Future[UcxReq] = {
     val hdr = ByteBuffer.allocateDirect(Utils.LONG_SIZE + Utils.LONG_SIZE)
     val hdrPtr = BufferUtils.address(hdr)
     val msgPtr = BufferUtils.address(msg)
@@ -76,18 +76,22 @@ class UcxEndpoint(worker: UcxWorker) extends Closeable with Logging {
 
     logDebug(s"$ucxEp sending ${remote}: $msg")
 
-    val req = ucxEp.endpoint.sendAmNonBlocking(
-      UcxAmID.MESSAGE, hdrPtr, hdr.remaining(), msgPtr, msg.remaining(), 0,
-      new UcxCallback {
-          override def onSuccess(request: UcpRequest): Unit = {
-            logDebug(s"$ucxEp send ${remote} success: $msg")
-          }
-          override def onError(ucsStatus: Int, errorMsg: String): Unit = {
-            logError(s"$ucxEp send ${remote} failed: $errorMsg")
-            hdr.clear()
-          }
-      }, MEMORY_TYPE.UCS_MEMORY_TYPE_HOST)
-    UcxReq(remote, ucxEp.txId, req)
+    val f = new FutureTask(() => {
+      val req = ucxEp.endpoint.sendAmNonBlocking(
+        UcxAmID.MESSAGE, hdrPtr, hdr.remaining(), msgPtr, msg.remaining(), 0,
+        new UcxCallback {
+            override def onSuccess(request: UcpRequest): Unit = {
+              logDebug(s"$ucxEp send ${remote} success: $msg")
+            }
+            override def onError(ucsStatus: Int, errorMsg: String): Unit = {
+              logError(s"$ucxEp send ${remote} failed: $errorMsg")
+              hdr.clear()
+            }
+        }, MEMORY_TYPE.UCS_MEMORY_TYPE_HOST)
+      UcxReq(remote, ucxEp.txId, req)
+    })
+    worker.post(f)
+    f
   }
 
   def setHandler(handler: UcxHandler): Unit = {
