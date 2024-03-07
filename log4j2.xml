@@ -15,6 +15,9 @@
         <Logger name="org.openucx.ucx" level="DEBUG" additivity="false">
             <AppenderRef ref="stdout" />
         </Logger>
+        <Logger name="jeyn.demo.ucx" level="DEBUG" additivity="false">
+            <AppenderRef ref="stdout" />
+        </Logger>
         <Root level="ERROR">
             <AppenderRef ref="stderr" />
         </Root>
