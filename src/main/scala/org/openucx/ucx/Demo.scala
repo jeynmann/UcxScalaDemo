@@ -175,7 +175,7 @@ class RecvMessage {
             val amStartTime = System.nanoTime()
             val buff = ByteBuffer.allocateDirect(ucpAmData.getLength.toInt)
             val buffAddress = UcxUtils.getAddress(buff)
-            UcxWorkerWrapper.get.worker.recvAmDataNonBlocking(ucpAmData.getDataHandle, buffAddress, buff.limit,
+            UcxWorker.get.worker.recvAmDataNonBlocking(ucpAmData.getDataHandle, buffAddress, buff.limit(),
                 new UcxCallback() {
                     override def onSuccess(r: UcpRequest): Unit = {
                         Log.trace(s"AmHandleTime for flightId $fid is ${System.nanoTime() - amStartTime} ns")
@@ -193,7 +193,7 @@ class Client extends Thread {
     private val bwMonitor = Global.monitor.get("ReadBW")
     private val latMonitor = Global.monitor.get("ReadLat")
 
-    val service = new UcxWorkerService()
+    val service = new UcxService()
 
     private val recvHandle = new UcpAmRecvCallback {
         override def onReceive(headerAddress: Long, headerSize: Long, ucpAmData: UcpAmData, ep: UcpEndpoint) = {
@@ -226,7 +226,7 @@ class Client extends Thread {
 
     def fetch(fid: Int, host: String, expect: Int) = {
         val startTime = System.nanoTime()
-        val worker = UcxWorkerWrapper.get
+        val worker = UcxWorker.get
         val ep = worker.getOrConnect(host)
 
         val headerSize = UnsafeUtils.INT_SIZE + worker.workerName.size
@@ -269,7 +269,7 @@ class Client extends Thread {
         val flight = new AtomicInteger
         for (i <- 0 until iterations) {
             while (!isInterrupted) {
-                UcxWorkerService.serverSocket.keys.flatMap { x => {
+                UcxService.serverSocket.keys.flatMap { x => {
                     acquire
                     Seq(service.submit(new Runnable {
                         override def run = fetch(flight.getAndIncrement, x, mesgSize)
@@ -334,7 +334,7 @@ class FetchMessage {
             buffer.put(message)
             buffer.rewind
             //  send fetch reply
-            val worker = UcxWorkerWrapper.get
+            val worker = UcxWorker.get
             val ep = worker.getOrConnectBack(workerName)
             val address = UnsafeUtils.getAdress(buffer)
             ep.sendAmNonBlocking(UcxAmId.FETCH_REPLY.id,
@@ -371,7 +371,7 @@ class Server extends Thread {
         (UcxAmId.FETCH.id, fetchHandle, UcpConstants.UCP_AM_FLAG_PERSISTENT_DATA | UcpConstants.UCP_AM_FLAG_WHOLE_MSG))
     // UcpConstants.UCP_AM_FLAG_PERSISTENT_DATA | 
 
-    val service = new UcxWorkerService()
+    val service = new UcxService()
 
     def init(n: Int, hostPort: String) = {
         service.initServer(n, hostPort, handles)

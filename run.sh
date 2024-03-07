@@ -1,23 +1,43 @@
 #!/usr/bin/env sh
 
-#  sh run.sh '' 3000 1 500 1
-#  sh run.sh 192.168.20.10:3000 '' 1 500 1
+export UCX_LOG_LEVEL=ERROR
+export UCX_ERROR_SIGNALS=""
+export UCX_USE_MT_MUTEX=yes
+export UCX_SOCKADDR_TLS_PRIORITY=tcp
+export UCX_TLS=tcp,dc_x
+export UCX_DC_MLX5_NUM_DCI=32
+export UCX_DC_TX_CQE_ZIP_ENABLE=yes
+export UCX_DC_RX_CQE_ZIP_ENABLE=yes
+export UCX_DC_MLX5_DCT_PORT_AFFINITY=random
+export UCX_IB_PCI_RELAXED_ORDERING=on
+export UCX_RC_SRQ_TOPO=cyclic_emulated
+export UCX_MAX_RNDV_RAILS=2
+export UCX_ZCOPY_THRESH=500
+export UCX_RNDV_THRESH=500
+export UCX_KEEPALIVE_INTERVAL=inf
+export UCX_NET_DEVICES=mlx5_bond_0:1,bond0
+export UCX_ADDRESS_VERSION=v2
 
-export JAVA_HOME=/usr/lib/jvm/TencentKona-8.0.6-292
-export JAVA_LIBRARY_PATH=$JAVA_HOME/jre/lib:$JAVA_HOME/jre/lib/amd64:$JAVA_HOME/jre/lib/amd64/jli:$JAVA_HOME/jre/lib/amd64/server
-export JAVA_OPTS="-Dlog4j.configurationFile=log4j2.xml -XX:MetaspaceSize=40m -XX:+PrintCommandLineFlags -Xmx10g -Xms10g -Djava.library.path=$JAVA_LIBRARY_PATH -XX:+PrintGCDetails -XX:+PrintGCDateStamps -Xloggc:/tmp/gc.log -verbose:gc -XX:SurvivorRatio=4 -XX:+UseMembar -XX:+UseCompressedOops -XX:+IgnoreUnrecognizedVMOptions -XX:+IgnoreNoShareValue -XX:CPUShareScaleFactor=6 -XX:CPUShareScaleLimit=15"
-
-host=$1
-port=$2
+size=$((4*1024))
+lead=$1
+bind=$2
 numClient=$3
 numServer=$4
 numFlight=$5
 
-scala \
-    target/ucx-demo-0.1-for-default-jar-with-dependencies.jar \
-    s=${host:=} \
-    p=${port:=3000} \
-    cli=${numClient:=1} \
-    srv=${numServer:=1} \
-    f=${numFlight=1} \
+arg=""
+if [ $host ];then
+    arg="$arg -a $host"
+fi
+if [ $port ];then
+    arg="$arg -b $port"
+fi
+if [ $numClient ];then
+    arg="$arg -cb $numClient"
+fi
+if [ $numServer ];then
+    arg="$arg -s $numServer"
+fi
+
+java -cp target/ucx-0.1-for-demo-jar-with-dependencies.jar jeyn.demo.ucx.example.Demo $arg
 

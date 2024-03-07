@@ -14,7 +14,7 @@ import org.openucx.jucx.ucs.UcsConstants
 import org.openucx.jucx.ucs.UcsConstants.MEMORY_TYPE
 import org.openucx.jucx.{UcxCallback, UcxException, UcxUtils}
 
-class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
+class UcxWorker(val worker: UcpWorker, id: Long = 0) extends Thread {
     // private val hostName = InetAddress.getLocalHost.getHostName
     private val uniName = s"${ManagementFactory.getRuntimeMXBean.getName}#$id"
 
@@ -53,7 +53,7 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
 
     def getOrConnectBack(host: String): UcpEndpoint = {
         connections.getOrElseUpdate(host,  {
-            val workerAddress = UcxWorkerService.clientWorker(host)
+            val workerAddress = UcxService.clientWorker(host)
 
             Log.debug(s"Server $this connecting to client($host, $workerAddress)")
 
@@ -73,7 +73,7 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
 
     def getOrConnect(host: String): UcpEndpoint = {
         connections.getOrElseUpdate(host,  {
-            val socketAddress = UcxWorkerService.serverSocket(host)
+            val socketAddress = UcxService.serverSocket(host)
             val endpointParams = new UcpEndpointParams()
                 .setPeerErrorHandlingMode()
                 .setSocketAddress(socketAddress)
@@ -110,7 +110,7 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
 
     def introduceListener(host: String): Unit = {
         connections.foreach { case (name, ep) => {
-            val socketAddress = UcxWorkerService.listenSocket(host)
+            val socketAddress = UcxService.listenSocket(host)
             val hostAddress = socketAddress.getAddress.getHostAddress
             val hostPort = socketAddress.getPort
             
@@ -154,7 +154,7 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
 
     override def run(): Unit = {
         Log.debug((s"Worker-$id start"))
-        UcxWorkerWrapper.set(this)
+        UcxWorker.set(this)
         while (!isInterrupted) {
             Option(taskQueue.poll()) match {
                 case Some(task) => {
@@ -168,7 +168,7 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
                 worker.waitForEvents()
             }
         }
-        UcxWorkerWrapper.set(null)
+        UcxWorker.set(null)
         Log.debug((s"Worker-$id stop"))
     }
 
@@ -193,7 +193,9 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
 
     @inline
     def close(): Unit = {
-        Log.debug((s"Worker-$id closing"))
+        Log.debug((s"Worker-$id close"))
+        interrupt
+        join(10)
         val reqs = connections.map {
             case (_, endpoint) => endpoint.closeNonBlockingForce()
         }
@@ -206,10 +208,10 @@ class UcxWorkerWrapper(val worker: UcpWorker, id: Long = 0) extends Thread {
     }
 }
 
-object UcxWorkerWrapper {
-    private val localWorker = new ThreadLocal[UcxWorkerWrapper]
-    private def set(worker: UcxWorkerWrapper) = {
+object UcxWorker {
+    private val localWorker = new ThreadLocal[UcxWorker]
+    private def set(worker: UcxWorker) = {
         localWorker.set(worker)
     }
-    def get: UcxWorkerWrapper = localWorker.get
+    def get: UcxWorker = localWorker.get
 }
