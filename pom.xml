@@ -30,17 +30,20 @@ See file LICENSE for terms.
   <properties>
     <maven.compiler.source>1.8</maven.compiler.source>
     <maven.compiler.target>1.8</maven.compiler.target>
+    <scala.version>2.11.12</scala.version>
+    <ucx.version>1.13.1</ucx.version>
+    <log4j.version>1.2.17</log4j.version>
+    <slf4j.version>1.7.30</slf4j.version>
     <encoding>UTF-8</encoding>
   </properties>
 
   <profiles>
     <profile>
       <id>demo</id>
+      <activation>
+        <activeByDefault>true</activeByDefault>
+      </activation>
       <properties>
-        <scala.version>2.11.12</scala.version>
-        <ucx.version>1.13.1</ucx.version>
-        <log4j.version>1.2.17</log4j.version>
-        <slf4j.version>1.7.30</slf4j.version>
         <mainClass>jeyn.demo.ucx.example.Demo</mainClass>
       </properties>
       <build>
@@ -59,9 +62,6 @@ See file LICENSE for terms.
     </profile>
     <profile>
       <id>demo.cluster</id>
-      <activation>
-        <activeByDefault>true</activeByDefault>
-      </activation>
       <properties>
         <mainClass>jeyn.demo.ucx.example.Demo</mainClass>
       </properties>
