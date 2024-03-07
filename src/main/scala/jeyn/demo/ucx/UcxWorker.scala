@@ -15,6 +15,9 @@ import scala.collection.mutable
 import scala.collection.concurrent.TrieMap
 
 class UcxWorker(val worker: UcpWorker, id: Long = 0) extends Closeable with Logging {
+  type ConnectedCb = UcxEp => Unit
+  type ClosedCb = UcxEp => Unit
+  type RequestCb = (UcxEp, UcxReq) => Unit
   // private val hostName = InetAddress.getLocalHost.getHostName
   // private val uniName = s"${ManagementFactory.getRuntimeMXBean.getName}#$id"
   // private val uniId: Long = wroker.getNativeId()
@@ -22,6 +25,7 @@ class UcxWorker(val worker: UcpWorker, id: Long = 0) extends Closeable with Logg
   private val executor = new WorkerThread(worker, true)
 
   private val rxHandlers = new TrieMap[Long, UcxRecv]
+  private val epHandlers = new TrieMap[UcpEndpoint, (ConnectedCb, ClosedCb)]
   private val connectedSAs = new mutable.HashMap[InetSocketAddress, UcxEp]
   private val connectedEps = new mutable.HashMap[UcpEndpoint, UcxSA]
   private val connectingEps = new mutable.HashMap[UcpEndpoint, UcxReq]
@@ -29,17 +33,22 @@ class UcxWorker(val worker: UcpWorker, id: Long = 0) extends Closeable with Logg
 
   private val errorHandler = new UcpEndpointErrorHandler {
     override def onError(ep: UcpEndpoint, ecode: Int, err: String): Unit = {
-      connectedEps.remove(ep).map(ucxEp => {
-        val address = ucxEp.address
-        val rxId = ucxEp.rxId
+      connectedEps.remove(ep).map(ucxSa => {
+        val address = ucxSa.address
+        val rxId = ucxSa.rxId
         if (ecode == STATUS.UCS_ERR_CONNECTION_RESET) {
           logInfo(s"Connection to $address rx $rxId closed.")
         } else {
           logWarning(s"Connection to $address rx $rxId error: $err")
         }
         connectedSAs.remove(address)
-        rxHandlers.remove(rxId).map(handler =>
-            logInfo(s"Remove $handler of $address."))
+        epHandlers.remove(ep).map(handlers => {
+          val closeCb = handlers._2
+          if (closeCb != null) {
+            closeCb(UcxEp(ep, ucxSa.rxId, ucxSa.txId))
+          }
+        })
+        rxHandlers.remove(rxId).map(handler => logDebug(s"Remove $handler of $address."))
         ep.close()
       })
     }
@@ -102,6 +111,7 @@ class UcxWorker(val worker: UcpWorker, id: Long = 0) extends Closeable with Logg
         _.closeNonBlockingFlush()).foreach(progress(_))
       connectedEps.clear()
       connectedSAs.clear()
+      epHandlers.clear()
       rxHandlers.clear()
     }
     if (!listeners.isEmpty) {
@@ -110,7 +120,7 @@ class UcxWorker(val worker: UcpWorker, id: Long = 0) extends Closeable with Logg
     }
   }
 
-  private[ucx] def bind(bindSA: InetSocketAddress, connectingCb: UcxReq => Unit): Future[UcpListener] = {
+  private[ucx] def bind(bindSA: InetSocketAddress, connectingCb: RequestCb): Future[UcpListener] = {
     val bindTask = new FutureTask(() => {
       listeners.getOrElseUpdate(bindSA, {
         val handler = new UcpListenerConnectionHandler {
@@ -123,7 +133,7 @@ class UcxWorker(val worker: UcpWorker, id: Long = 0) extends Closeable with Logg
             val ep = worker.newEndpoint(params)
             val ucxReq = UcxReq(address, 0, null)
             connectingEps.getOrElseUpdate(ep, ucxReq)
-            connectingCb(ucxReq)
+            connectingCb(UcxEp(ep, 0, 0), ucxReq)
           }
         }
         val listenerParams = new UcpListenerParams().setSockAddr(bindSA)
@@ -135,8 +145,7 @@ class UcxWorker(val worker: UcpWorker, id: Long = 0) extends Closeable with Logg
     bindTask
   }
 
-  private[ucx] def connect(server: InetSocketAddress): Future[UcxReq] = {
-    var ucxReq = null
+  private[ucx] def connect(server: InetSocketAddress, connectingCb: RequestCb): Future[UcxReq] = {
     val connectTask = new FutureTask(() => {
       val ep = connectedSAs.getOrElse(server, {
         val params = new UcpEndpointParams().setSocketAddress(server)
@@ -169,7 +178,9 @@ class UcxWorker(val worker: UcpWorker, id: Long = 0) extends Closeable with Logg
                 }
             }, MEMORY_TYPE.UCS_MEMORY_TYPE_HOST)
 
-        UcxReq(server, 0, req)
+        val ucxReq = UcxReq(server, 0, req)
+        connectingCb(UcxEp(ep, 0, 0), ucxReq)
+        ucxReq
       })
     })
     executor.post(connectTask)
@@ -215,7 +226,12 @@ class UcxWorker(val worker: UcpWorker, id: Long = 0) extends Closeable with Logg
   }
 
   private[ucx] def setHandler(ucxEp: UcxEp, handler: UcxRecv): Option[UcxRecv] = {
+    logDebug(s"Add $handler of ${ucxEp.rxId}.")
     rxHandlers.put(ucxEp.rxId, handler)
+  }
+
+  private[ucx] def setHandler(ucxEp: UcxEp, connectedCb: ConnectedCb, closeCb: ClosedCb): Option[(ConnectedCb, ClosedCb)] = {
+    epHandlers.put(ucxEp.endpoint, (connectedCb, closeCb))
   }
 
   private def handleConnect(ep: UcpEndpoint, txId: Long, rxId: Long): Unit = {
@@ -249,6 +265,12 @@ class UcxWorker(val worker: UcpWorker, id: Long = 0) extends Closeable with Logg
     connectingEps.remove(ep).map(req => {
       connectedEps.getOrElseUpdate(ep, UcxSA(req.address, txId, rxId))
       connectedSAs.getOrElseUpdate(req.address, UcxEp(ep, txId, rxId))
+      epHandlers.get(ep).map(handlers => {
+        val connectedCb = handlers._1
+        if (connectedCb != null) {
+          connectedCb(UcxEp(ep, txId, rxId))
+        }
+      })
     })
   }
 

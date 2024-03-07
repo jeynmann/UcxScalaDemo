@@ -29,22 +29,23 @@ class UcxListener(worker: UcxWorker) extends Closeable with Logging {
     bindFuture = worker.bind(address, newEndpoint _)
   }
 
-  def newEndpoint(ucxReq: UcxReq): Unit = {
-    endpoints.getOrElseUpdate(ucxReq.address, {
-      val endpoint = new UcxEndpoint(worker)
-      if (handler != null) {
-        endpoint.setHandler(handler)
-      }
-      endpoint.connectFuture = new FutureTask(() => ucxReq)
-      endpoint
-    })
-  }
-
   def setHandler(h: UcxHandler): Unit = {
     if (!endpoints.isEmpty) {
       endpoints.values.foreach(_.setHandler(h))
     }
     handler = h
+  }
+
+  private def newEndpoint(ucxEp: UcxEp, ucxReq: UcxReq): UcxEndpoint = {
+    endpoints.getOrElseUpdate(ucxReq.address, {
+      val endpoint = new UcxEndpoint(worker)
+      if (handler != null) {
+        endpoint.setHandler(handler)
+      }
+      endpoint.connectingCb(ucxEp, ucxReq)
+      endpoint.connectFuture = new FutureTask(() => ucxReq)
+      endpoint
+    })
   }
 
   override def close() = {
@@ -57,10 +58,13 @@ class UcxEndpoint(worker: UcxWorker) extends Closeable with Logging {
   private[ucx] var remote: InetSocketAddress = _
   private[ucx] var ucxEp: UcxEp = _
   private[ucx] var ucxRecv: UcxRecv = _
+  private var bOpened = false
+  private var bConnected = false
 
   def connect(address: InetSocketAddress): Unit = {
-    connectFuture = worker.connect(address)
+    connectFuture = worker.connect(address, connectingCb _)
     remote = address
+    bOpened = true
   }
 
   def send(msg: ByteBuffer): Future[UcxReq] = {
@@ -103,7 +107,7 @@ class UcxEndpoint(worker: UcxWorker) extends Closeable with Logging {
     }
   }
 
-  private def awaitReady(): Unit = {
+  private[ucx] def awaitReady(): Unit = {
     if (ucxEp == null) {
       assert(connectFuture != null)
       // send connect
@@ -112,11 +116,25 @@ class UcxEndpoint(worker: UcxWorker) extends Closeable with Logging {
       worker.submit(() => worker.progress(() => worker.isConnected(remote))).get()
       // get ep
       ucxEp = worker.getUcxEp(remote)
-      // set handle
-      if (ucxRecv != null) {
-        worker.setHandler(ucxEp, ucxRecv)
-      }
     }
+  }
+
+  private[ucx] def connectingCb(ucxEp: UcxEp, ucxReq: UcxReq): Unit = {
+    worker.setHandler(ucxEp, connectedCb _, closedCb _)
+  }
+
+  private[ucx] def connectedCb(ucxEp: UcxEp): Unit = {
+    if (ucxRecv != null) {
+      worker.setHandler(ucxEp, ucxRecv)
+    }
+    bConnected = true
+  }
+
+  private[ucx] def closedCb(ucxEp: UcxEp): Unit = {
+    if (ucxRecv != null) {
+      worker.setHandler(ucxEp, ucxRecv)
+    }
+    bConnected = false
   }
 
   override def close() = {
