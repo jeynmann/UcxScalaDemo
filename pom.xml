@@ -9,8 +9,8 @@ See file LICENSE for terms.
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
                       http://maven.apache.org/maven-v4_0_0.xsd">
   <modelVersion>4.0.0</modelVersion>
-  <groupId>org.openucx</groupId>
-  <artifactId>ucx-demo</artifactId>
+  <groupId>jeyn.demo</groupId>
+  <artifactId>ucx</artifactId>
   <version>0.1</version>
   <name>${project.artifactId}</name>
   <description>
@@ -35,12 +35,12 @@ See file LICENSE for terms.
 
   <profiles>
     <profile>
-      <id>default</id>
+      <id>demo</id>
       <properties>
         <scala.version>2.11.12</scala.version>
-        <scala.compat.version>2.11</scala.compat.version>
         <ucx.version>1.13.1</ucx.version>
-        <log4j2.version>2.6.2</log4j2.version>
+        <log4j.version>1.2.17</log4j.version>
+        <slf4j.version>1.7.30</slf4j.version>
         <mainClass>jeyn.demo.ucx.example.Demo</mainClass>
       </properties>
       <build>
@@ -50,7 +50,7 @@ See file LICENSE for terms.
             <artifactId>scala-maven-plugin</artifactId>
             <configuration>
               <excludes>
-                <exclude>**/exclude/**</exclude>
+                <exclude>src/main/scala/org/**</exclude>
               </excludes>
             </configuration>
           </plugin>
@@ -58,13 +58,12 @@ See file LICENSE for terms.
       </build>
     </profile>
     <profile>
-      <id>default-0.1</id>
+      <id>demo.cluster</id>
+      <activation>
+        <activeByDefault>true</activeByDefault>
+      </activation>
       <properties>
-        <scala.version>2.11.12</scala.version>
-        <scala.compat.version>2.11</scala.compat.version>
-        <ucx.version>1.13.1</ucx.version>
-        <log4j2.version>2.6.2</log4j2.version>
-        <mainClass>org.openucx.ucx.Demo</mainClass>
+        <mainClass>jeyn.demo.ucx.example.Demo</mainClass>
       </properties>
       <build>
         <plugins>
@@ -73,7 +72,7 @@ See file LICENSE for terms.
             <artifactId>scala-maven-plugin</artifactId>
             <configuration>
               <excludes>
-                <exclude>**/exclude/**</exclude>
+                <exclude>src/main/scala/jeyn/**</exclude>
               </excludes>
             </configuration>
           </plugin>
@@ -88,7 +87,6 @@ See file LICENSE for terms.
       <groupId>org.scala-lang</groupId>
       <artifactId>scala-library</artifactId>
       <version>${scala.version}</version>
-      <scope>compile</scope>
     </dependency>
     <dependency>
       <groupId>org.scalacheck</groupId>
@@ -102,25 +100,33 @@ See file LICENSE for terms.
         </exclusion>
       </exclusions>
     </dependency>
-    <dependency>
-      <groupId>org.apache.logging.log4j</groupId>
-      <artifactId>log4j-core</artifactId>
-      <version>${log4j2.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>org.apache.logging.log4j</groupId>
-      <artifactId>log4j-api</artifactId>
-      <version>${log4j2.version}</version>
-    </dependency>
-    <dependency>
-      <groupId>commons-cli</groupId>
-      <artifactId>commons-cli</artifactId>
-      <version>1.0</version>
-    </dependency>
+
     <dependency>
       <groupId>org.openucx</groupId>
       <artifactId>jucx</artifactId>
       <version>${ucx.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>log4j</groupId>
+      <artifactId>log4j</artifactId>
+      <version>${log4j.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>${slf4j.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-log4j12</artifactId>
+      <version>${slf4j.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>commons-cli</groupId>
+      <artifactId>commons-cli</artifactId>
+      <version>1.0</version>
     </dependency>
   </dependencies>
 

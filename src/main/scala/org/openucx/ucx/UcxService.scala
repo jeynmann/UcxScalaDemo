@@ -12,8 +12,7 @@ import org.openucx.jucx.ucp._
 import org.openucx.jucx.ucs.UcsConstants
 import org.openucx.jucx.ucs.UcsConstants.MEMORY_TYPE
 
-import org.apache.logging.log4j.LogManager;
-
+import org.apache.log4j.LogManager
 
 class UcxService extends AbstractExecutorService {
     val id = new AtomicInteger()

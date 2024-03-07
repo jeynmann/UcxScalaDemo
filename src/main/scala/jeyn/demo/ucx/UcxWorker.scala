@@ -5,125 +5,16 @@ import org.openucx.jucx.ucs.UcsConstants.STATUS
 import org.openucx.jucx.ucs.UcsConstants.MEMORY_TYPE
 import org.openucx.jucx.{UcxCallback, UcxException}
 
-import java.lang.management.ManagementFactory
-import java.net.InetSocketAddress
 import java.io.Closeable
 import java.nio.ByteBuffer
-import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.{CountDownLatch, Future, FutureTask}
+import java.net.InetSocketAddress
+import java.util.concurrent.{Future, FutureTask}
+import java.lang.management.ManagementFactory
 
-import scala.collection.concurrent.TrieMap
 import scala.collection.mutable
+import scala.collection.concurrent.TrieMap
 
-trait UcxHandler {
-  def onReceive(endpoint: UcxEndpoint, msg: ByteBuffer): Unit = {}
-}
-
-class UcxListener(worker: UcxWorker) extends Closeable with UcxLogging {
-  private[ucx] val endpoints = new TrieMap[InetSocketAddress, UcxEndpoint]
-  private[ucx] var listener: UcpListener = _
-  private[ucx] var handler: UcxHandler = _
-
-  def bind(port: Int): Unit = {
-    listener = worker.bind(new InetSocketAddress("0.0.0.0", port), newEndpoint _)
-  }
-
-  def bind(address: InetSocketAddress): Unit = {
-    listener = worker.bind(address, newEndpoint _)
-  }
-
-  def newEndpoint(ucxReq: UcxReq): Unit = {
-    endpoints.getOrElseUpdate(ucxReq.address, {
-      val endpoint = new UcxEndpoint(worker)
-      if (handler != null) {
-        endpoint.setHandler(handler)
-      }
-      endpoint.ucxReq = ucxReq
-      endpoint
-    })
-  }
-
-  def setHandler(h: UcxHandler): Unit = {
-    if (!endpoints.isEmpty) {
-      endpoints.values.foreach(_.setHandler(h))
-    }
-    handler = h
-  }
-
-  override def close() = {
-    // TODO
-  }
-}
-
-class UcxEndpoint(worker: UcxWorker) extends Closeable with UcxLogging {
-  private[ucx] var ucxEp: UcxEp = _
-  private[ucx] var ucxReq: UcxReq = _
-  private[ucx] var ucxRecv: UcxRecv = _
-
-  def connect(address: InetSocketAddress): Unit = {
-    ucxReq = worker.connect(address)
-  }
-
-  def send(msg: ByteBuffer): UcxReq = {
-    val hdr = ByteBuffer.allocateDirect(Utils.LONG_SIZE + Utils.LONG_SIZE)
-    val hdrPtr = BufferUtils.address(hdr)
-    val msgPtr = BufferUtils.address(msg)
-
-    awaitReady()
-
-    hdr.putLong(ucxEp.txId)
-    hdr.putLong(0) // TODO: msgId
-    hdr.rewind()
-
-    logDebug(s"$ucxEp sending ${ucxReq.address}: $msg")
-
-    val req = ucxEp.endpoint.sendAmNonBlocking(
-      UcxAmID.MESSAGE, hdrPtr, hdr.remaining(), msgPtr, msg.remaining(), 0,
-      new UcxCallback {
-          override def onSuccess(request: UcpRequest): Unit = {
-            logDebug(s"$ucxEp send ${ucxReq.address} success: $msg")
-          }
-          override def onError(ucsStatus: Int, errorMsg: String): Unit = {
-            logError(s"$ucxEp send ${ucxReq.address} failed: $errorMsg")
-            hdr.clear()
-          }
-      }, MEMORY_TYPE.UCS_MEMORY_TYPE_HOST)
-    UcxReq(ucxReq.address, ucxEp.txId, req)
-  }
-
-  def setHandler(handler: UcxHandler): Unit = {
-    ucxRecv = new UcxRecv {
-      override def onReceive(msg: ByteBuffer) = handler.onReceive(UcxEndpoint.this, msg)
-    }
-    if (ucxEp != null) {
-      worker.setHandler(ucxEp, ucxRecv)
-    }
-  }
-
-  private def awaitReady(): Unit = {
-    if (ucxEp == null) {
-      assert(ucxReq != null)
-
-      val latch = new CountDownLatch(1)
-      worker.submit(() => {
-        worker.progress(() => worker.isConnected(ucxReq.address))
-        latch.countDown()
-      })
-      latch.await()
-
-      ucxEp = worker.getUcxEp(ucxReq.address)
-      if (ucxRecv != null) {
-        worker.setHandler(ucxEp, ucxRecv)
-      }
-    }
-  }
-
-  override def close() = {
-    // TODO
-  }
-}
-
-class UcxWorker(val worker: UcpWorker, id: Long = 0) extends Closeable with UcxLogging {
+class UcxWorker(val worker: UcpWorker, id: Long = 0) extends Closeable with Logging {
   // private val hostName = InetAddress.getLocalHost.getHostName
   // private val uniName = s"${ManagementFactory.getRuntimeMXBean.getName}#$id"
   // private val uniId: Long = wroker.getNativeId()
@@ -218,58 +109,76 @@ class UcxWorker(val worker: UcpWorker, id: Long = 0) extends Closeable with UcxL
     }
   }
 
-  private[ucx] def bind(bindSA: InetSocketAddress, connectingCb: UcxReq => Unit): UcpListener = {
-    val handler = new UcpListenerConnectionHandler {
-      override def onConnectionRequest(conReq: UcpConnectionRequest): Unit = {
-        val address = conReq.getClientAddress()
-        val id = conReq.getClientId()
-        val params = new UcpEndpointParams().setConnectionRequest(conReq)
-            .setPeerErrorHandlingMode().setErrorHandler(errorHandler)
-            .setName(s"$bindSA receive connect from $address-$id")
-        val ep = worker.newEndpoint(params)
-        val ucxReq = UcxReq(address, 0, null)
-        connectingEps.getOrElseUpdate(ep, ucxReq)
-        connectingCb(ucxReq)
-      }
-    }
-    val listenerParams = new UcpListenerParams().setSockAddr(bindSA)
-        .setConnectionHandler(handler)
-
-    listeners.getOrElseUpdate(bindSA, { worker.newListener(listenerParams) })
+  private[ucx] def bind(bindSA: InetSocketAddress, connectingCb: UcxReq => Unit): Future[UcpListener] = {
+    val bindTask = new FutureTask(() => {
+      listeners.getOrElseUpdate(bindSA, {
+        val handler = new UcpListenerConnectionHandler {
+          override def onConnectionRequest(conReq: UcpConnectionRequest): Unit = {
+            val address = conReq.getClientAddress()
+            val id = conReq.getClientId()
+            val params = new UcpEndpointParams().setConnectionRequest(conReq)
+                .setPeerErrorHandlingMode().setErrorHandler(errorHandler)
+                .setName(s"$bindSA receive connect from $address-$id")
+            val ep = worker.newEndpoint(params)
+            val ucxReq = UcxReq(address, 0, null)
+            connectingEps.getOrElseUpdate(ep, ucxReq)
+            connectingCb(ucxReq)
+          }
+        }
+        val listenerParams = new UcpListenerParams().setSockAddr(bindSA)
+            .setConnectionHandler(handler)
+        worker.newListener(listenerParams)
+      })
+    })
+    executor.post(bindTask)
+    bindTask
   }
 
-  private[ucx] def connect(server: InetSocketAddress): UcxReq = {
-    val params = new UcpEndpointParams().setSocketAddress(server)
-      .setPeerErrorHandlingMode().setErrorHandler(errorHandler)
-      .setName(s"Client to $server").sendClientId()
+  private[ucx] def connect(server: InetSocketAddress): Future[UcxReq] = {
+    var ucxReq = null
+    val connectTask = new FutureTask(() => {
+      val ep = connectedSAs.getOrElse(server, {
+        val params = new UcpEndpointParams().setSocketAddress(server)
+          .setPeerErrorHandlingMode().setErrorHandler(errorHandler)
+          .setName(s"Client to $server").sendClientId()
 
-    val header = ByteBuffer.allocateDirect(Utils.LONG_SIZE)
-    val ptr = BufferUtils.address(header)
+        logDebug(s"$id connecting to $server")
 
-    logDebug(s"$id connecting to $server")
+        UcxEp(worker.newEndpoint(params), 0, 0)
+      }).endpoint
 
-    val ep = worker.newEndpoint(params)
-    val rxId = ep.getNativeId()
-    header.putLong(rxId)
-    header.rewind()
+      connectingEps.getOrElseUpdate(ep, {
+        val header = ByteBuffer.allocateDirect(Utils.LONG_SIZE)
+        val ptr = BufferUtils.address(header)
+        val rxId = ep.getNativeId()
+        header.putLong(rxId)
+        header.rewind()
 
-    val req = ep.sendAmNonBlocking(UcxAmID.CONNECT, ptr, header.remaining(), ptr, 0,
-        UcpConstants.UCP_AM_SEND_FLAG_EAGER | UcpConstants.UCP_AM_SEND_FLAG_REPLY,
-        new UcxCallback {
-            override def onSuccess(request: UcpRequest): Unit = {
-              logDebug(s"$id CONNECT to $server success")
-            }
-            override def onError(ucsStatus: Int, errorMsg: String): Unit = {
-              logError(s"$id CONNECT to $server failed: $errorMsg")
-              header.clear()
-            }
-        }, MEMORY_TYPE.UCS_MEMORY_TYPE_HOST)
+        logDebug(s"$id CONNECT to $server")
 
-    connectingEps.getOrElseUpdate(ep, UcxReq(server, 0, req))
+        val req = ep.sendAmNonBlocking(UcxAmID.CONNECT, ptr, header.remaining(), ptr, 0,
+            UcpConstants.UCP_AM_SEND_FLAG_EAGER | UcpConstants.UCP_AM_SEND_FLAG_REPLY,
+            new UcxCallback {
+                override def onSuccess(request: UcpRequest): Unit = {
+                  logDebug(s"$id CONNECT to $server success")
+                }
+                override def onError(ucsStatus: Int, errorMsg: String): Unit = {
+                  logError(s"$id CONNECT to $server failed: $errorMsg")
+                  header.clear()
+                }
+            }, MEMORY_TYPE.UCS_MEMORY_TYPE_HOST)
+
+        UcxReq(server, 0, req)
+      })
+    })
+    executor.post(connectTask)
+    connectTask
   }
 
-  private[ucx] def submit(task: Runnable): Unit = {
-    executor.post(task)
+  private[ucx] def submit(task: Runnable): Future[Unit.type] = {
+    val f = new FutureTask(task, Unit)
+    executor.post(f)
+    f
   }
 
   private[ucx] def progress(req: UcpRequest): Unit = {
@@ -304,13 +213,6 @@ class UcxWorker(val worker: UcpWorker, id: Long = 0) extends Closeable with UcxL
     rxHandlers.put(ucxEp.rxId, handler)
   }
 
-  private def connected(ep: UcpEndpoint, txId: Long, rxId: Long): Unit = {
-    connectingEps.remove(ep).map(req => {
-      connectedEps.getOrElseUpdate(ep, UcxSA(req.address, txId, rxId))
-      connectedSAs.getOrElseUpdate(req.address, UcxEp(ep, txId, rxId))
-    })
-  }
-
   private def handleConnect(ep: UcpEndpoint, txId: Long, rxId: Long): Unit = {
     val header = ByteBuffer.allocateDirect(Utils.LONG_SIZE)
     val ptr = BufferUtils.address(header)
@@ -336,6 +238,13 @@ class UcxWorker(val worker: UcpWorker, id: Long = 0) extends Closeable with UcxL
 
   private def handleConnectReply(ep: UcpEndpoint, txId: Long, rxId: Long): Unit = { 
     connected(ep, txId, rxId)
+  }
+
+  private def connected(ep: UcpEndpoint, txId: Long, rxId: Long): Unit = {
+    connectingEps.remove(ep).map(req => {
+      connectedEps.getOrElseUpdate(ep, UcxSA(req.address, txId, rxId))
+      connectedSAs.getOrElseUpdate(req.address, UcxEp(ep, txId, rxId))
+    })
   }
 
   private def handleMessage(rxId: Long, msgId: Long, amData: UcpAmData): Unit = {
@@ -380,5 +289,5 @@ private[ucx] trait UcxRecv {
 private[ucx] object UcxAmID {
     val CONNECT = 0
     val CONNECT_REPLY = 1
-    val MESSAGE = 10
+    val MESSAGE = 2
 }

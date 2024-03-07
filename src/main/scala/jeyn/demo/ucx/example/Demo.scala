@@ -8,7 +8,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.net.InetSocketAddress
 import java.nio.ByteBuffer
 
-object Demo {
+object Demo extends Logging {
     val stopping = new AtomicBoolean
     val running = new AtomicBoolean
 
@@ -52,7 +52,7 @@ object Demo {
 
         NativeLibs.load()
 
-        val transport = new Transport()
+        val transport = new UcxTransport()
         println(s"created transport.")
         if (!host.isEmpty()) {
             val namePort = host.split(":")
@@ -67,37 +67,43 @@ object Demo {
             println(s"created listener.")
         }
 
+        val msg = ByteBuffer.allocateDirect(msgSize)
+        while (msg.remaining() > 0) {
+            msg.putChar(('A' + (msg.remaining() & 15)).toChar)
+        }
+
+        val handle = new UcxHandler {
+            override def onReceive(endpoint: UcxEndpoint, msg: ByteBuffer): Unit = {
+                println(s"receive $msg from $endpoint")
+            }
+        }
+
         val task = new Thread {
             override def run = {
                 while (!running.get()) { Thread.sleep(1000) }
                 transport.ucxWorker.start()
                 println(s"worker started.")
+
                 if (transport.ucxEndpoint != null) {
-                    val msg = ByteBuffer.allocateDirect(msgSize)
-                    while (msg.remaining() > 0) {
-                        msg.putChar(('A' + (msg.remaining() & 15)).toChar)
-                    }
-                    while (!stopping.get()) {
-                        Thread.sleep(1000)
-                        transport.ucxEndpoint.send(msg)
-                        println(s"Client running")
-                    }
+                    transport.ucxEndpoint.setHandler(handle)
                 }
                 if (transport.ucxListerner != null) {
-                    val handle = new UcxHandler {
-                        override def onReceive(endpoint: UcxEndpoint, msg: ByteBuffer): Unit = {
-                            println(s"receive $msg from $endpoint")
-                        }
-                    }
                     transport.ucxListerner.setHandler(handle)
-                    while (!stopping.get()) {
-                        Thread.sleep(1000)
+                }
+
+                while (!stopping.get()) {
+                    if (transport.ucxListerner != null) {
                         println(s"Server running")
                     }
+                    if (transport.ucxEndpoint != null) {
+                        println(s"Client running")
+                        transport.ucxEndpoint.send(msg)
+                    }
+                    Thread.sleep(1000)
                 }
+
                 transport.ucxWorker.close()
                 println(s"worker closed.")
-
             }
         }
         task.start()

@@ -12,7 +12,7 @@ import org.openucx.jucx.ucs.UcsConstants.MEMORY_TYPE
 import scala.collection.concurrent.TrieMap
 import scala.collection.mutable.Set
 
-class Transport extends UcxLogging {
+class UcxTransport extends Logging {
   val ucpParams = new UcpParams()
     .requestAmFeature()
     .setMtWorkersShared(true)

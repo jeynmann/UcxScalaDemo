@@ -13,7 +13,7 @@ import java.math.{MathContext, RoundingMode}
 
 import scala.util.control.NonFatal
 
-trait UcxLogging {
+trait Logging {
   // Log methods that take only a String
   protected def logInfo(msg: => String) {
     if (log.isInfoEnabled) log.info(msg)
@@ -70,7 +70,7 @@ trait UcxLogging {
   @transient private var log_ : Logger = null
 }
 
-object FnUtils extends UcxLogging {
+object FnUtils extends Logging {
   type Fn = () => Unit
   type Catcher = (Throwable) => Unit
 
@@ -103,7 +103,7 @@ object BufferUtils {
   }
 }
 
-object IOUtils extends UcxLogging {
+object IOUtils extends Logging {
   def tryOrIOException[T](block: => T): T = {
     try {
       block
