@@ -2,7 +2,7 @@
 # Copmile
 
 ``` sh
-mvn -DskipTests clean package -Pdefault -T2C
+mvn -DskipTests clean package -T2C
 ```
 
 # Run
