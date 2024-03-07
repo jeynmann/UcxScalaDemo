@@ -1,5 +1,8 @@
 package jeyn.demo.ucx.example
 
+import org.apache.log4j.LogManager
+import org.apache.log4j.PropertyConfigurator
+
 import org.apache.commons.cli.{GnuParser, HelpFormatter, Options}
 import org.openucx.jucx.NativeLibs
 import jeyn.demo.ucx._
@@ -11,6 +14,19 @@ import java.nio.ByteBuffer
 object Demo extends Logging {
     val stopping = new AtomicBoolean
     val running = new AtomicBoolean
+
+    def initializeLogging(): Unit = {
+        val log4j12Initialized = LogManager.getRootLogger.getAllAppenders.hasMoreElements
+        // scalastyle:off println
+        if (!log4j12Initialized) {
+            val url = new java.io.File("log4j.properties").toURI().toURL()
+            PropertyConfigurator.configure(url)
+            println(s"Using Demo's default log4j profile: $url")
+        }
+  
+        val rootLogger = LogManager.getRootLogger()
+        rootLogger.getLevel()
+    }
 
     def main(args:Array[String]) = {
         val parser = new GnuParser()
@@ -50,21 +66,22 @@ object Demo extends Logging {
         println(s"numClients=${numClients}")
         println(s"numServers=${numServers}")
 
+        initializeLogging()
         NativeLibs.load()
 
         val transport = new UcxTransport()
-        println(s"created transport.")
+        logInfo(s"created transport.")
         if (!host.isEmpty()) {
             val namePort = host.split(":")
             val (name, port) = (namePort(0), namePort(1).toInt)
             transport.ucxEndpoint = transport.ucxWorker.newEndpoint()
             transport.ucxEndpoint.connect(new InetSocketAddress(name, port))
-            println(s"created endpoint.")
+            logInfo(s"created endpoint.")
         }
         if (port != 0) {
             transport.ucxListerner = transport.ucxWorker.newListener()
             transport.ucxListerner.bind(port)
-            println(s"created listener.")
+            logInfo(s"created listener.")
         }
 
         val msg = ByteBuffer.allocateDirect(msgSize)
@@ -74,7 +91,7 @@ object Demo extends Logging {
 
         val handle = new UcxHandler {
             override def onReceive(endpoint: UcxEndpoint, msg: ByteBuffer): Unit = {
-                println(s"receive $msg from $endpoint")
+                logInfo(s"receive $msg from $endpoint")
             }
         }
 
@@ -82,7 +99,7 @@ object Demo extends Logging {
             override def run = {
                 while (!running.get()) { Thread.sleep(1000) }
                 transport.ucxWorker.start()
-                println(s"worker started.")
+                logInfo(s"worker started.")
 
                 if (transport.ucxEndpoint != null) {
                     transport.ucxEndpoint.setHandler(handle)
@@ -93,17 +110,17 @@ object Demo extends Logging {
 
                 while (!stopping.get()) {
                     if (transport.ucxListerner != null) {
-                        println(s"Server running")
+                        logInfo(s"Server running")
                     }
                     if (transport.ucxEndpoint != null) {
-                        println(s"Client running")
+                        logInfo(s"Client running")
                         transport.ucxEndpoint.send(msg)
                     }
                     Thread.sleep(1000)
                 }
 
                 transport.ucxWorker.close()
-                println(s"worker closed.")
+                logInfo(s"worker closed.")
             }
         }
         task.start()
